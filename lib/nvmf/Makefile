@@ -55,7 +55,7 @@ endif
 ifeq ($(CONFIG_OFI),y)
 # libfabric-backed OFI transport. libfabric is resolved via pkg-config
 # (e.g. -I/usr/local/include -L/usr/local/lib -lfabric).
-C_SRCS += ofi.c
+C_SRCS += ofi.c ofi_sb.c
 CFLAGS += $(shell pkg-config --cflags libfabric 2>/dev/null)
 LOCAL_SYS_LIBS += $(shell pkg-config --libs libfabric 2>/dev/null)
 endif
