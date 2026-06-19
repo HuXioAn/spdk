@@ -99,6 +99,10 @@ CONFIG_RDMA_SET_ACK_TIMEOUT=n
 CONFIG_RDMA_SET_TOS=n
 CONFIG_RDMA_PROV=verbs
 
+# Enable the OFI (libfabric) transport for the NVMf target.
+# Requires libfabric development libraries (>= 1.20; 1.22 used in dev).
+CONFIG_OFI=n
+
 # Enable NVMe Character Devices.
 CONFIG_NVME_CUSE=y
 

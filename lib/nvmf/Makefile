@@ -52,6 +52,14 @@ CFLAGS += -I$(CONFIG_FC_PATH)
 endif
 endif
 
+ifeq ($(CONFIG_OFI),y)
+# libfabric-backed OFI transport. libfabric is resolved via pkg-config
+# (e.g. -I/usr/local/include -L/usr/local/lib -lfabric).
+C_SRCS += ofi.c
+CFLAGS += $(shell pkg-config --cflags libfabric 2>/dev/null)
+LOCAL_SYS_LIBS += $(shell pkg-config --libs libfabric 2>/dev/null)
+endif
+
 SPDK_MAP_FILE = $(abspath $(CURDIR)/spdk_nvmf.map)
 
 include $(SPDK_ROOT_DIR)/mk/spdk.lib.mk

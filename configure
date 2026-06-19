@@ -90,6 +90,8 @@ function usage() {
 	echo " --without-fc              If an argument is provided, it is considered a directory containing"
 	echo "                           libufc.a and fc_lld.h. Otherwise the regular system paths will"
 	echo "                           be searched."
+	echo " --with-ofi                Build OFI (libfabric) transport for NVMf target."
+	echo " --without-ofi             Requires libfabric development libraries (>= 1.20)."
 	echo " --with-daos[=DIR]         Build DAOS bdev module."
 	echo " --without-daos            No path required."
 	echo " --with-shared             Build spdk shared libraries."
@@ -492,6 +494,12 @@ for i in "$@"; do
 		--without-fc)
 			CONFIG[FC]=n
 			CONFIG[FC_PATH]=
+			;;
+		--with-ofi)
+			CONFIG[OFI]=y
+			;;
+		--without-ofi)
+			CONFIG[OFI]=n
 			;;
 		--with-daos)
 			CONFIG[DAOS]=y
@@ -947,6 +955,16 @@ fi
 if [[ "${CONFIG[FC]}" = "y" ]]; then
 	if [[ -n "${CONFIG[FC_PATH]}" ]]; then
 		check_dir "${CONFIG[FC_PATH]}"
+	fi
+fi
+
+if [ "${CONFIG[OFI]}" = "y" ]; then
+	if ! echo -e '#include <rdma/fabric.h>\nint main(void) { return 0; }\n' \
+		| "${BUILD_CMD[@]}" $(pkg-config --cflags libfabric 2>/dev/null) \
+		$(pkg-config --libs libfabric 2>/dev/null) - 2> /dev/null; then
+		echo "--with-ofi requires libfabric development libraries (>= 1.20)."
+		echo "Please install then re-run this script."
+		exit 1
 	fi
 fi
 

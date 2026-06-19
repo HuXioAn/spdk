@@ -270,6 +270,11 @@ endif
 SYS_LIBS += -lufc
 endif
 
+ifeq ($(CONFIG_OFI),y)
+# libfabric (OFI transport). Resolved via pkg-config (e.g. -L/usr/local/lib -lfabric).
+SYS_LIBS += $(shell pkg-config --libs libfabric 2>/dev/null)
+endif
+
 ifeq ($(CONFIG_DEBUG), y)
 COMMON_CFLAGS += -DDEBUG -g3 -O0 -fno-omit-frame-pointer
 else
