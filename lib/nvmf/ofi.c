@@ -88,6 +88,21 @@ enum spdk_nvmf_ofi_sb_state {
  * 16 bytes, CXI is 8; 256 is generous and bounds the ADDR_EXCHANGE payload. */
 #define NVMF_OFI_MAX_EP_ADDR_LEN	256
 
+/* V1 data-path framing (design §6.1) — MUST match the host (lib/nvme/nvme_ofi.c).
+ * The CID rides the CQ immediate-data field as a 64-bit tag (cid<<8 | type). */
+enum spdk_nvmf_ofi_msg_type {
+	SPDK_NVMF_OFI_MSG_SQE	= 1,	/* host->target: 64B SQE [+ WRITE data] */
+	SPDK_NVMF_OFI_MSG_CQE	= 4,	/* target->host: 16B CQE [+ READ data]  */
+};
+#define SPDK_NVMF_OFI_BUILD_TAG(cid, type)	(((uint64_t)(cid) << 8) | (uint64_t)(type))
+#define SPDK_NVMF_OFI_TAG_CID(tag)		((uint16_t)(((tag) >> 8) & 0xffff))
+
+/* V1 in-capsule data ceiling (caps a single MSG's payload). */
+#define NVMF_OFI_IN_CAPSULE_DATA_SIZE	4096
+/* Recv buffer: 64B SQE + in-capsule data. Send buffer: 16B CQE + in-capsule data. */
+#define NVMF_OFI_RECV_BUF_SIZE	(sizeof(struct spdk_nvme_cmd) + NVMF_OFI_IN_CAPSULE_DATA_SIZE)
+#define NVMF_OFI_SEND_BUF_SIZE	(sizeof(struct spdk_nvme_cpl) + NVMF_OFI_IN_CAPSULE_DATA_SIZE)
+
 /* Forward declaration so create() can reference the ops table. */
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ofi;
 
@@ -129,6 +144,8 @@ struct spdk_nvmf_ofi_sb_conn {
 	uint16_t			peer_port;
 	char				peer_provider[32];
 	uint32_t			peer_ep_addr_len;
+	char				local_ip[SPDK_NVMF_TRADDR_MAX_LEN];	/* listener IP — bind EP src to it */
+	struct spdk_nvme_transport_id	listen_trid;		/* the listener this conn arrived on */
 	uint8_t				peer_ep_addr[NVMF_OFI_MAX_EP_ADDR_LEN];
 
 	/* P1c EP bring-up: the qpair (with its EP) is created on the pg thread; the
@@ -197,12 +214,52 @@ struct spdk_nvmf_ofi_qpair {
 	struct fid_ep				*ep;
 	fi_addr_t				peer_fi_addr;	/* AV handle for the peer */
 	bool					ep_enabled;
+	bool					mr_local;
+
+	/* V1 data-path pools (allocated in poll_group_add, on the pg thread). */
+	struct spdk_nvmf_ofi_recv_slot		*recv_slots;
+	struct spdk_nvmf_ofi_req		*reqs;
+	TAILQ_HEAD(, spdk_nvmf_ofi_req)	free_reqs;
+	uint32_t				num_slots;	/* == queue depth */
+	bool					pools_ready;
 
 	struct spdk_nvme_transport_id		peer_trid;
 	struct spdk_nvme_transport_id		local_trid;
 	struct spdk_nvme_transport_id		listen_trid;
 
 	TAILQ_ENTRY(spdk_nvmf_ofi_qpair)	link;
+};
+
+/* A pre-posted recv buffer (one per outstanding command slot). op_context
+ * passed to fi_recv points here, so a CQ entry maps back to its qpair. */
+struct spdk_nvmf_ofi_recv_slot {
+	struct spdk_nvmf_ofi_qpair	*oqpair;
+	void				*buf;		/* NVMF_OFI_RECV_BUF_SIZE */
+	void				*desc;		/* MR desc (FI_MR_LOCAL) or NULL */
+	struct fid_mr			*mr;		/* MR handle when mr_local */
+	bool				posted;
+};
+
+/*
+ * A transport request: embeds the core's spdk_nvmf_request plus the storage for
+ * its cmd/rsp and its response send buffer. One per outstanding command slot.
+ * On recv, a free req is paired with the recv slot whose buffer holds the
+ * command; the slot is held until the response is sent (zero-copy H2C data).
+ */
+struct spdk_nvmf_ofi_req {
+	struct spdk_nvmf_request		req;		/* must be first */
+	struct spdk_nvmf_ofi_qpair		*oqpair;
+	union nvmf_h2c_msg			cmd_storage;
+	union nvmf_c2h_msg			rsp_storage;
+	struct spdk_nvmf_ofi_recv_slot		*recv_slot;	/* held during H2C processing */
+	void					*send_buf;	/* CQE [+ data] */
+	void					*send_desc;
+	struct fid_mr				*send_mr;
+	void					*data_buf;	/* C2H response buffer (core fills) */
+	void					*data_desc;
+	struct fid_mr				*data_mr;
+	bool					send_in_flight;
+	TAILQ_ENTRY(spdk_nvmf_ofi_req)		link;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -680,6 +737,22 @@ nvmf_ofi_ep_setup_on_pg(void *ctx)
 		SPDK_ERRLOG("fi_endpoint failed: %s\n", fi_strerror(-rc));
 		goto out;
 	}
+	/* Bind the EP's source address to the listener's NIC. fi_getinfo(node=NULL)
+	 * lets the tcp provider pick an arbitrary interface (e.g. 192.168.200.1),
+	 * which the peer cannot reach; pin it to the listen IP (port 0 = ephemeral). */
+	if (conn->local_ip[0] != '\0' &&
+	    otransport->info->addr_format == FI_SOCKADDR_IN) {
+		struct sockaddr_in src = {0};
+		src.sin_family = AF_INET;
+		src.sin_port = 0;
+		if (inet_pton(AF_INET, conn->local_ip, &src.sin_addr) == 1) {
+			rc = fi_setname(&oqpair->ep->fid, &src, sizeof(src));
+			if (rc != 0) {
+				SPDK_WARNLOG("fi_setname(%s) failed: %s (continuing)\n",
+					     conn->local_ip, fi_strerror(-rc));
+			}
+		}
+	}
 	rc = fi_ep_bind(oqpair->ep, &pg->av->fid, 0);
 	if (rc != 0) {
 		SPDK_ERRLOG("fi_ep_bind(av) failed: %s\n", fi_strerror(-rc));
@@ -711,6 +784,13 @@ nvmf_ofi_ep_setup_on_pg(void *ctx)
 		goto out;
 	}
 	conn->local_ep_addr_len = addrlen;
+	if (addrlen >= sizeof(struct sockaddr_in)) {
+		struct sockaddr_in *sin = (struct sockaddr_in *)conn->local_ep_addr;
+		char ip[INET_ADDRSTRLEN] = {0};
+		inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+		SPDK_INFOLOG(nvmf_ofi, "ofi target: local EP sockaddr = %s:%u (fam=%u)\n",
+			       ip, ntohs(sin->sin_port), sin->sin_family);
+	}
 
 	/* Insert the peer's address (parsed from its ADDR_EXCHANGE) into the AV. */
 	ninsert = fi_av_insert(pg->av, conn->peer_ep_addr, 1, &peer, 0, NULL);
@@ -902,8 +982,12 @@ nvmf_ofi_sb_handle_frame(struct spdk_nvmf_ofi_sb_conn *conn,
 		snprintf(oqpair->peer_trid.trsvcid, sizeof(oqpair->peer_trid.trsvcid), "%u", conn->peer_port);
 		oqpair->peer_trid.trtype = SPDK_NVME_TRANSPORT_CUSTOM_FABRICS;
 		oqpair->peer_trid.adrfam = SPDK_NVMF_ADRFAM_IPV4;
-		oqpair->listen_trid = oqpair->peer_trid;
-		oqpair->local_trid = oqpair->peer_trid;
+		/* listen_trid MUST be the listener's trid (192.168.200.41:4421) so the
+		 * core's listener-access check matches the subsystem's listener; the
+		 * local EP/data path uses a different ephemeral port and is irrelevant
+		 * to NVMe-oF addressing. */
+		oqpair->listen_trid = conn->listen_trid;
+		oqpair->local_trid = conn->listen_trid;
 
 		conn->oqpair = NULL;	/* ownership passes to nvmf / the poll group */
 		spdk_nvmf_tgt_new_qpair(otransport->transport.tgt, &oqpair->qpair);
@@ -1017,11 +1101,15 @@ nvmf_ofi_accept_cb(void *ctx, struct spdk_sock_group *group, struct spdk_sock *l
 		conn->sock = sock;
 		conn->transport = otransport;
 		conn->state = OFI_SB_WAIT_HELLO;
+		conn->listen_trid = listener->trid;
 
 		if (spdk_sock_getaddr(sock, saddr, sizeof(saddr), &sport,
 				      caddr, sizeof(caddr), &cport) == 0) {
 			snprintf(conn->peer_addr, sizeof(conn->peer_addr), "%s", caddr);
 			conn->peer_port = cport;
+			/* saddr is the listener's local IP — bind the EP's source to it so
+			 * the tcp provider picks the right NIC (not an arbitrary interface). */
+			snprintf(conn->local_ip, sizeof(conn->local_ip), "%s", saddr);
 		}
 
 		rc = spdk_sock_group_add_sock(otransport->listen_sock_group, sock,
@@ -1192,6 +1280,106 @@ nvmf_ofi_get_optimal_poll_group(struct spdk_nvmf_qpair *qpair)
 	return &oqpair->group->group;
 }
 
+/* -------------------------------------------------------------------------- */
+/* V1 data-path helpers (run on the poll-group thread)                        */
+/* -------------------------------------------------------------------------- */
+
+static int
+nvmf_ofi_post_recv(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_recv_slot *slot)
+{
+	ssize_t rc;
+
+	do {
+		rc = fi_recv(oqpair->ep, slot->buf, NVMF_OFI_RECV_BUF_SIZE, slot->desc,
+			     oqpair->peer_fi_addr, slot);
+	} while (rc == -FI_EAGAIN);
+
+	if (rc != 0) {
+		SPDK_ERRLOG("ofi target: fi_recv: %s\n", fi_strerror(-(int)rc));
+		return (int)rc;
+	}
+	slot->posted = true;
+	return 0;
+}
+
+static struct spdk_nvmf_ofi_req *
+nvmf_ofi_req_get(struct spdk_nvmf_ofi_qpair *oqpair)
+{
+	struct spdk_nvmf_ofi_req *req = TAILQ_FIRST(&oqpair->free_reqs);
+
+	if (req == NULL) {
+		return NULL;
+	}
+	TAILQ_REMOVE(&oqpair->free_reqs, req, link);
+	memset(&req->cmd_storage, 0, sizeof(req->cmd_storage));
+	memset(&req->rsp_storage, 0, sizeof(req->rsp_storage));
+	req->req.raw = 0;
+	req->recv_slot = NULL;
+	req->send_in_flight = false;
+	return req;
+}
+
+/* Release a request after its response has been sent: re-post the held recv
+ * slot and return the req to the free pool. */
+static void
+nvmf_ofi_req_release(struct spdk_nvmf_ofi_req *req)
+{
+	struct spdk_nvmf_ofi_qpair *oqpair = req->oqpair;
+
+	if (req->recv_slot != NULL) {
+		req->recv_slot->posted = false;
+		nvmf_ofi_post_recv(oqpair, req->recv_slot);
+		req->recv_slot = NULL;
+	}
+	TAILQ_INSERT_TAIL(&oqpair->free_reqs, req, link);
+}
+
+static void
+nvmf_ofi_qpair_free_pools(struct spdk_nvmf_ofi_qpair *oqpair)
+{
+	uint32_t i;
+
+	for (i = 0; i < oqpair->num_slots && oqpair->recv_slots; i++) {
+		if (oqpair->mr_local && oqpair->recv_slots[i].mr) {
+			fi_close(&oqpair->recv_slots[i].mr->fid);
+		}
+		spdk_free(oqpair->recv_slots[i].buf);
+	}
+	for (i = 0; i < oqpair->num_slots && oqpair->reqs; i++) {
+		if (oqpair->mr_local && oqpair->reqs[i].send_mr) {
+			fi_close(&oqpair->reqs[i].send_mr->fid);
+		}
+		if (oqpair->mr_local && oqpair->reqs[i].data_mr) {
+			fi_close(&oqpair->reqs[i].data_mr->fid);
+		}
+		spdk_free(oqpair->reqs[i].send_buf);
+		spdk_free(oqpair->reqs[i].data_buf);
+	}
+	free(oqpair->recv_slots);
+	free(oqpair->reqs);
+	oqpair->recv_slots = NULL;
+	oqpair->reqs = NULL;
+	oqpair->pools_ready = false;
+}
+
+/* Best-effort C2H data length from the command (admin NUMD / IO SGL), clamped to
+ * the in-capsule ceiling. Good enough for V1 admin responses (Identify/GetLog). */
+static uint32_t
+nvmf_ofi_cmd_data_len(const union nvmf_h2c_msg *cmd)
+{
+	const struct spdk_nvme_cmd *c = &cmd->nvme_cmd;
+	uint32_t len;
+
+	if (c->opc == SPDK_NVME_OPC_FABRIC || c->opc == SPDK_NVME_OPC_IDENTIFY ||
+	    c->opc == SPDK_NVME_OPC_GET_LOG_PAGE) {
+		/* NUMD (dwords-1) is in cdw10 for these; length = (NUMD+1)*4. */
+		len = (c->cdw10 + 1) << 2;
+	} else {
+		len = c->dptr.sgl1.unkeyed.length;
+	}
+	return spdk_min(len, NVMF_OFI_IN_CAPSULE_DATA_SIZE);
+}
+
 static int
 nvmf_ofi_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 			struct spdk_nvmf_qpair *qpair)
@@ -1200,14 +1388,72 @@ nvmf_ofi_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 		SPDK_CONTAINEROF(group, struct spdk_nvmf_ofi_poll_group, group);
 	struct spdk_nvmf_ofi_qpair *oqpair =
 		SPDK_CONTAINEROF(qpair, struct spdk_nvmf_ofi_qpair, qpair);
+	struct spdk_nvmf_ofi_transport *otransport = oqpair->transport;
+	uint32_t qd, i;
+	int rc;
 
 	/* Must be the pg we pre-selected: the EP's CQ is bound to it. */
 	assert(oqpair->group == opgroup);
+	qd = otransport->transport.opts.max_queue_depth;
+	oqpair->num_slots = qd;
+	oqpair->mr_local = (otransport->info->domain_attr->mr_mode & FI_MR_LOCAL) != 0;
+	TAILQ_INIT(&oqpair->free_reqs);
+
+	oqpair->recv_slots = calloc(qd, sizeof(*oqpair->recv_slots));
+	oqpair->reqs = calloc(qd, sizeof(*oqpair->reqs));
+	if (oqpair->recv_slots == NULL || oqpair->reqs == NULL) {
+		rc = -ENOMEM;
+		goto err;
+	}
+	for (i = 0; i < qd; i++) {
+		struct spdk_nvmf_ofi_recv_slot *rs = &oqpair->recv_slots[i];
+		struct spdk_nvmf_ofi_req *rq = &oqpair->reqs[i];
+
+		rs->oqpair = oqpair;
+		rs->buf = spdk_zmalloc(NVMF_OFI_RECV_BUF_SIZE, 0, NULL,
+				       SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+		rq->oqpair = oqpair;
+		rq->send_buf = spdk_zmalloc(NVMF_OFI_SEND_BUF_SIZE, 0, NULL,
+					    SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+		rq->data_buf = spdk_zmalloc(NVMF_OFI_IN_CAPSULE_DATA_SIZE, 0, NULL,
+					    SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+		if (rs->buf == NULL || rq->send_buf == NULL || rq->data_buf == NULL) {
+			rc = -ENOMEM;
+			goto err;
+		}
+		if (oqpair->mr_local) {
+			fi_mr_reg(opgroup->domain, rs->buf, NVMF_OFI_RECV_BUF_SIZE,
+				  FI_RECV, 0, 0, 0, &rs->mr, NULL);
+			fi_mr_reg(opgroup->domain, rq->send_buf, NVMF_OFI_SEND_BUF_SIZE,
+				  FI_SEND, 0, 0, 0, &rq->send_mr, NULL);
+			fi_mr_reg(opgroup->domain, rq->data_buf, NVMF_OFI_IN_CAPSULE_DATA_SIZE,
+				  FI_READ | FI_WRITE, 0, 0, 0, &rq->data_mr, NULL);
+			rs->desc = rs->mr ? fi_mr_desc(rs->mr) : NULL;
+			rq->send_desc = rq->send_mr ? fi_mr_desc(rq->send_mr) : NULL;
+			rq->data_desc = rq->data_mr ? fi_mr_desc(rq->data_mr) : NULL;
+		}
+		TAILQ_INSERT_TAIL(&oqpair->free_reqs, rq, link);
+	}
+
+	/* Pre-post a recv for every slot now that the EP is enabled. */
+	for (i = 0; i < qd; i++) {
+		rc = nvmf_ofi_post_recv(oqpair, &oqpair->recv_slots[i]);
+		if (rc != 0) {
+			goto err;
+		}
+	}
+	oqpair->pools_ready = true;
+
 	TAILQ_INSERT_TAIL(&opgroup->qpairs, oqpair, link);
-	SPDK_INFOLOG(nvmf_ofi, "qpair added to pg thread %s (ep=%p peer_fi_addr=0x%lx)\n",
+	SPDK_INFOLOG(nvmf_ofi, "qpair added to pg thread %s (ep=%p peer_fi_addr=0x%lx qd=%u)\n",
 		     spdk_thread_get_name(opgroup->thread), (void *)oqpair->ep,
-		     (unsigned long)oqpair->peer_fi_addr);
+		     (unsigned long)oqpair->peer_fi_addr, qd);
 	return 0;
+
+err:
+	SPDK_ERRLOG("ofi target: poll_group_add pool alloc failed\n");
+	nvmf_ofi_qpair_free_pools(oqpair);
+	return rc;
 }
 
 static int
@@ -1220,14 +1466,102 @@ nvmf_ofi_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 		SPDK_CONTAINEROF(qpair, struct spdk_nvmf_ofi_qpair, qpair);
 
 	TAILQ_REMOVE(&opgroup->qpairs, oqpair, link);
+	nvmf_ofi_qpair_free_pools(oqpair);
 	return 0;
 }
 
+/*
+ * Drain the poll group's rx CQ and dispatch. Recv completions deliver a command
+ * capsule (SQE [+ in-capsule data]); tx completions mean a response was sent and
+ * its req can be recycled. All on the pg thread (FI_THREAD_DOMAIN).
+ */
 static int
 nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
-	/* P1a: no qpair EPs/CQs yet, nothing to poll. */
-	return 0;
+	struct spdk_nvmf_ofi_poll_group *opgroup =
+		SPDK_CONTAINEROF(group, struct spdk_nvmf_ofi_poll_group, group);
+	struct fi_cq_data_entry entry;
+	struct fi_cq_err_entry err;
+	uint32_t reaped = 0;
+	ssize_t rc;
+	while (reaped < 64) {
+		rc = fi_cq_read(opgroup->cq_rx, &entry, 1);
+		if (rc == -FI_EAGAIN) {
+			break;
+		}
+		if (rc == -FI_EAVAIL) {
+			memset(&err, 0, sizeof(err));
+			fi_cq_readerr(opgroup->cq_rx, &err, 0);
+			SPDK_WARNLOG("ofi target: CQ error err=%d prov=%d\n", err.err, err.prov_errno);
+			break;
+		}
+		if (rc < 0) {
+			SPDK_ERRLOG("ofi target: fi_cq_read: %zd\n", rc);
+			break;
+		}
+		reaped++;
+
+		if (entry.flags & FI_RECV) {
+			struct spdk_nvmf_ofi_recv_slot *slot = entry.op_context;
+			struct spdk_nvmf_ofi_qpair *oqpair = slot->oqpair;
+			struct spdk_nvmf_ofi_req *req;
+			struct spdk_nvme_cmd *sqe;
+			uint32_t data_len;
+
+			slot->posted = false;
+			req = nvmf_ofi_req_get(oqpair);
+			if (req == NULL) {
+				SPDK_WARNLOG("ofi target: no free req, dropping cmd\n");
+				nvmf_ofi_post_recv(oqpair, slot);
+				continue;
+			}
+			/* Copy the SQE out of the recv buffer (data stays in place for H2C). */
+			sqe = (struct spdk_nvme_cmd *)slot->buf;
+			memcpy(&req->cmd_storage, sqe, sizeof(req->cmd_storage));
+			req->req.cmd = &req->cmd_storage;
+			req->req.rsp = &req->rsp_storage;
+			req->req.qpair = &oqpair->qpair;
+			req->req.xfer = spdk_nvmf_req_get_xfer(&req->req);
+			req->recv_slot = slot;	/* hold the slot for zero-copy H2C data */
+			SPDK_DEBUGLOG(nvmf_ofi, "ofi target: recv cmd opc=0x%x cid=%u len=%zu xfer=%u\n",
+				       sqe->opc, sqe->cid, entry.len, req->req.xfer);
+
+			if (entry.len > sizeof(struct spdk_nvme_cmd)) {
+				/* HOST_TO_CONTROLLER in-capsule data (e.g. CONNECT/WRITE). */
+				data_len = entry.len - sizeof(struct spdk_nvme_cmd);
+				if (sqe->opc == SPDK_NVME_OPC_FABRIC && data_len >= 1024) {
+					const char *cd = (char *)slot->buf + sizeof(struct spdk_nvme_cmd);
+					SPDK_DEBUGLOG(nvmf_ofi, "ofi target: connect data subnqn='%s' hostnqn='%s'\n",
+						       cd + 256, cd + 512);
+				}
+				req->req.iov[0].iov_base = (char *)slot->buf + sizeof(struct spdk_nvme_cmd);
+				req->req.iov[0].iov_len = data_len;
+				req->req.length = data_len;
+				req->req.iovcnt = 1;
+				req->req.data_from_pool = false;
+			} else if (req->req.xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
+				/* Response data: provide a buffer the core fills. */
+				data_len = nvmf_ofi_cmd_data_len(req->req.cmd);
+				req->req.iov[0].iov_base = req->data_buf;
+				req->req.iov[0].iov_len = data_len;
+				req->req.length = data_len;
+				req->req.iovcnt = 1;
+				req->req.data_from_pool = false;
+			} else {
+				req->req.length = 0;
+				req->req.iovcnt = 0;
+			}
+
+			spdk_nvmf_request_exec(&req->req);
+		} else {
+			/* TX completion: a response MSG was sent — recycle its req. */
+			struct spdk_nvmf_ofi_req *req = entry.op_context;
+			req->send_in_flight = false;
+			nvmf_ofi_req_release(req);
+		}
+	}
+
+	return reaped;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1286,25 +1620,74 @@ nvmf_ofi_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 	return 0;
 }
 
-static void
-nvmf_ofi_req_free(struct spdk_nvmf_request *req)
-{
-	/* P1c: recycle send/recv pool indices + clear req_table[cid]. */
-	SPDK_DEBUGLOG(nvmf_ofi, "req_free stub (P1c)\n");
-}
-
+/*
+ * The core finished a command; send the response. The response is a single MSG
+ * carrying the 16B CQE [+ CONTROLLER_TO_HOST data appended]. The data (for a
+ * successful READ/Identify/GetLog) was filled by the core into req->iov.
+ */
 static void
 nvmf_ofi_req_complete(struct spdk_nvmf_request *req)
 {
-	/* P1c: encapsulate response + fi_sendv. */
-	SPDK_DEBUGLOG(nvmf_ofi, "req_complete stub (P1c)\n");
+	struct spdk_nvmf_ofi_req *oreq = SPDK_CONTAINEROF(req, struct spdk_nvmf_ofi_req, req);
+	struct spdk_nvmf_ofi_qpair *oqpair = oreq->oqpair;
+	struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
+	uint64_t tag = SPDK_NVMF_OFI_BUILD_TAG(rsp->cid, SPDK_NVMF_OFI_MSG_CQE);
+	uint32_t send_len = sizeof(struct spdk_nvme_cpl);
+	struct iovec iov;
+	struct fi_msg msg = {0};
+	ssize_t rc;
+
+	SPDK_DEBUGLOG(nvmf_ofi, "ofi target: req_complete cid=%u sct=%u sc=%u xfer=%u len=%u\n",
+		       rsp->cid, rsp->status.sct, rsp->status.sc, req->xfer, req->length);
+
+	/* Build the response capsule: CQE first, then any C2H data. */
+	memcpy(oreq->send_buf, rsp, sizeof(*rsp));
+	if (spdk_nvme_cpl_is_success(rsp) &&
+	    req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST && req->length > 0 &&
+	    req->iovcnt > 0) {
+		uint32_t dlen = spdk_min(req->length, NVMF_OFI_IN_CAPSULE_DATA_SIZE);
+		memcpy((char *)oreq->send_buf + sizeof(*rsp), req->iov[0].iov_base, dlen);
+		send_len += dlen;
+	}
+
+	iov.iov_base = oreq->send_buf;
+	iov.iov_len = send_len;
+	msg.msg_iov = &iov;
+	msg.desc = &oreq->send_desc;
+	msg.iov_count = 1;
+	msg.addr = oqpair->peer_fi_addr;
+	msg.context = oreq;
+	msg.data = tag;
+
+	rc = fi_sendmsg(oqpair->ep, &msg, FI_REMOTE_CQ_DATA | FI_COMPLETION);
+	if (rc != 0) {
+		SPDK_ERRLOG("ofi target: response fi_sendmsg: %s\n", fi_strerror(-(int)rc));
+		/* Drop the request so the slot can be re-posted. */
+		nvmf_ofi_req_release(oreq);
+		return;
+	}
+	oreq->send_in_flight = true;
+	/* The req is recycled on the tx completion (poll_group_poll). */
 }
 
+/* Core-initiated free (abort / qpair teardown path). Recycle the req. */
+static void
+nvmf_ofi_req_free(struct spdk_nvmf_request *req)
+{
+	struct spdk_nvmf_ofi_req *oreq = SPDK_CONTAINEROF(req, struct spdk_nvmf_ofi_req, req);
+
+	if (oreq->send_in_flight) {
+		return;	/* will be freed on tx completion */
+	}
+	nvmf_ofi_req_release(oreq);
+}
+
+/* V1 does not use the async iobuf pool (all data is in-capsule / pre-allocated),
+ * so this is never driven in the current design — kept as a safe no-op. */
 static void
 nvmf_ofi_req_get_buffers_done(struct spdk_nvmf_request *req)
 {
-	/* P1c: iobuf async buffer ready. */
-	SPDK_DEBUGLOG(nvmf_ofi, "req_get_buffers_done stub (P1c)\n");
+	SPDK_WARNLOG("ofi target: req_get_buffers_done unexpected (V1 uses in-capsule)\n");
 }
 
 static void

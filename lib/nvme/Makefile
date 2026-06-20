@@ -21,6 +21,12 @@ C_SRCS-$(CONFIG_RDMA) += nvme_rdma.c
 
 LIBNAME = nvme
 LOCAL_SYS_LIBS =
+ifeq ($(CONFIG_OFI),y)
+# libfabric-backed OFI host transport, resolved via pkg-config.
+C_SRCS += nvme_ofi.c
+CFLAGS += $(shell pkg-config --cflags libfabric 2>/dev/null)
+LOCAL_SYS_LIBS += $(shell pkg-config --libs libfabric 2>/dev/null)
+endif
 ifeq ($(CONFIG_RDMA),y)
 LOCAL_SYS_LIBS += -libverbs -lrdmacm
 #Attach only if FreeBSD and RDMA is specified with configure
