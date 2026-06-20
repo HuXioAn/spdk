@@ -42,6 +42,7 @@
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_cm.h>		/* fi_getname */
+#include <rdma/fi_rma.h>		/* keyed SGL → target-initiated RMA (V2) */
 #include <rdma/fi_errno.h>
 
 /* -------------------------------------------------------------------------- */
@@ -50,12 +51,18 @@
 
 #define NVME_OFI_DEFAULT_PROVIDER	"tcp"
 #define NVME_OFI_PROVIDER_ENV		"OFI_PROVIDER"
+/* OFI_RMA=0 forces the V1 in-capsule data path; unset/non-zero = V2 target RMA. */
+#define NVME_OFI_RMA_ENV		"OFI_RMA"
 #define NVME_OFI_FI_VERSION		FI_VERSION(1, 22)
 
 /* V1 in-capsule data ceiling. An IO whose data exceeds this is rejected (V2
  * RMA handles large IO). Sized to hold a Fabrics CONNECT data struct and an
  * Identify response, the largest admin payloads. */
 #define NVME_OFI_IN_CAPSULE_DATA_SIZE	4096
+
+/* V2 RMA single-transfer ceiling — MUST match the target's per-req bounce buffer
+ * (NVMF_OFI_RMA_DATA_SIZE in lib/nvmf/ofi.c). */
+#define NVME_OFI_RMA_DATA_SIZE		131072
 
 /* Per-qpair recv/send slot counts == submission-queue depth. The host pre-posts
  * `qdepth` recv buffers (one per possible outstanding CID) and has `qdepth`
@@ -188,6 +195,22 @@ struct nvme_ofi_send_slot {
 	bool			busy;
 };
 
+/*
+ * Per-qpair remote-data MR cache (V2 RMA). For each IO the host registers the
+ * data buffer ONCE and advertises {addr,key} in the keyed SGL; the target RMAs
+ * directly into/out of it (zero-copy on the host). Steady-state must NOT
+ * re-register per IO (p0b_findings MR-cache), so cache by buffer vaddr. The
+ * spdk_nvme_perf buffer pool is small + reused, so a flat linear cache suffices.
+ */
+#define NVME_OFI_MR_CACHE_N	256
+struct nvme_ofi_mr_cache_entry {
+	void		*buf;
+	size_t		len;
+	struct fid_mr	*mr;
+	uint64_t	addr;	/* advertised remote addr: vaddr (FI_MR_VIRT_ADDR) or 0 */
+	uint64_t	key;	/* fi_mr_key */
+};
+
 struct nvme_ofi_qpair {
 	struct spdk_nvme_qpair		qpair;		/* must be first */
 
@@ -227,6 +250,14 @@ struct nvme_ofi_qpair {
 	 * nvme_request objects; we keep a pointer here to complete on CQE. */
 	struct nvme_request		**req_table;
 	uint32_t			req_table_sz;
+
+	/* V2 RMA: when set, non-CONNECT data commands advertise a keyed SGL and the
+	 * target moves the data over RMA instead of in-capsule. */
+	bool				use_rma;
+	struct nvme_ofi_mr_cache_entry	mr_cache[NVME_OFI_MR_CACHE_N];
+	uint32_t			mr_cache_n;
+	uint64_t			mr_reg;		/* stat: registrations (cache miss) */
+	uint64_t			mr_hit;		/* stat: cache hits */
 };
 
 struct nvme_ofi_ctrlr {
@@ -238,6 +269,11 @@ struct nvme_ofi_ctrlr {
 	struct fid_av			*av;
 
 	char				provider[32];
+	bool				use_rma;	/* OFI_RMA env: V2 data path (default on) */
+	/* RMA MR keys are per-DOMAIN (shared by every qpair on this ctrlr), so the
+	 * requested-key counter for non-PROV_KEY providers must live here, not on the
+	 * qpair — else two qpairs both start at 1 and collide (-FI_EKEYREJECTED). */
+	uint64_t			mr_next_key;
 };
 
 static inline struct nvme_ofi_qpair *
@@ -628,6 +664,17 @@ nvme_ofi_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 	}
 	snprintf(tctrlr->provider, sizeof(tctrlr->provider), "%s", prov);
 
+	/* V2 RMA data path on by default; OFI_RMA=0 selects the V1 in-capsule path
+	 * (used for A/B comparison — the target adapts per-command from the SGL type,
+	 * so only the host chooses). */
+	{
+		const char *rma = getenv(NVME_OFI_RMA_ENV);
+		tctrlr->use_rma = (rma == NULL || rma[0] == '\0') ? true : (atoi(rma) != 0);
+		tctrlr->mr_next_key = 1;	/* domain-wide requested_key allocator (non-PROV_KEY) */
+		SPDK_INFOLOG(nvme_ofi, "ofi host: data path = %s\n",
+			     tctrlr->use_rma ? "V2 (target RMA)" : "V1 (in-capsule)");
+	}
+
 	/* Per-ctrlr (== per-domain) libfabric resources. Created up-front so every
 	 * qpair on this ctrlr shares the domain/av; the EP is per-qpair. */
 	rc = nvme_ofi_getinfo(tctrlr->provider, &tctrlr->info);
@@ -779,6 +826,7 @@ nvme_ofi_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 	tqpair->peer_fi_addr = FI_ADDR_NOTAVAIL;
 	tqpair->num_slots = qsize;
 	tqpair->req_table_sz = num_requests;
+	tqpair->use_rma = tctrlr->use_rma;
 
 	/* One CQ per qpair (tx+rx bound to it). */
 	cq_attr.size = qsize * 2;
@@ -857,6 +905,12 @@ nvme_ofi_qpair_free_res(struct nvme_ofi_qpair *tqpair)
 		free(tqpair->send_slots);
 	}
 	free(tqpair->req_table);
+	/* Close the V2 remote-data MRs (registered lazily by nvme_ofi_mr_get). */
+	for (i = 0; i < tqpair->mr_cache_n; i++) {
+		if (tqpair->mr_cache[i].mr) {
+			fi_close(&tqpair->mr_cache[i].mr->fid);
+		}
+	}
 	if (tqpair->cq) { fi_close(&tqpair->cq->fid); }
 	free(tqpair);
 }
@@ -1184,6 +1238,85 @@ nvme_ofi_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 /* qpair_submit_request / qpair_process_completions (V1 data path)            */
 /* -------------------------------------------------------------------------- */
 
+/*
+ * Look up (or register) a remote-data MR for a host buffer and return the
+ * {addr,key} the target needs to RMA into/out of it. Registered with both remote
+ * READ (target fi_read for NVMe WRITE) and remote WRITE (target fi_write for NVMe
+ * READ) so one MR serves either direction. Cached by buffer vaddr; on overflow
+ * the oldest entry is closed and evicted (the perf buffer set is small, so this
+ * is rare). bind/enable only on FI_MR_ENDPOINT (CXI).
+ *
+ * Key handling: when the negotiated mr_mode has FI_MR_PROV_KEY (verbs;ofi_rxm,
+ * CXI — AND tcp here, because the transport requests PROV_KEY in its getinfo
+ * hints to satisfy verbs) the PROVIDER assigns the key, so requested_key MUST be
+ * 0 — passing a caller key gets -FI_EKEYREJECTED. Only when PROV_KEY is absent
+ * does the caller supply a unique key per MR. (The prototype passed caller keys
+ * on tcp because it never requested PROV_KEY in hints — see p0b_findings #3.)
+ */
+static int
+nvme_ofi_mr_get(struct nvme_ofi_qpair *tqpair, void *buf, size_t len,
+		uint64_t *out_addr, uint64_t *out_key)
+{
+	struct nvme_ofi_ctrlr *tctrlr = tqpair->tctrlr;
+	const uint64_t access = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+	bool prov_key = (tctrlr->info->domain_attr->mr_mode & FI_MR_PROV_KEY) != 0;
+	struct nvme_ofi_mr_cache_entry *e;
+	struct fid_mr *mr = NULL;
+	uint64_t key, addr, req_key;
+	uint32_t i;
+	int rc;
+
+	for (i = 0; i < tqpair->mr_cache_n; i++) {
+		if (tqpair->mr_cache[i].buf == buf && tqpair->mr_cache[i].len >= len) {
+			tqpair->mr_hit++;
+			*out_addr = tqpair->mr_cache[i].addr;
+			*out_key = tqpair->mr_cache[i].key;
+			return 0;
+		}
+	}
+
+	if (tqpair->mr_cache_n >= NVME_OFI_MR_CACHE_N) {
+		/* Evict the oldest entry (FIFO). */
+		if (tqpair->mr_cache[0].mr) {
+			fi_close(&tqpair->mr_cache[0].mr->fid);
+		}
+		memmove(&tqpair->mr_cache[0], &tqpair->mr_cache[1],
+			(NVME_OFI_MR_CACHE_N - 1) * sizeof(tqpair->mr_cache[0]));
+		tqpair->mr_cache_n--;
+	}
+
+	req_key = prov_key ? 0 : __atomic_fetch_add(&tctrlr->mr_next_key, 1, __ATOMIC_RELAXED);
+	rc = fi_mr_reg(tctrlr->domain, buf, len, access, 0, req_key, 0, &mr, NULL);
+	if (rc != 0) {
+		SPDK_ERRLOG("ofi host: fi_mr_reg (remote data): %s\n", fi_strerror(-rc));
+		return rc;
+	}
+	if (tctrlr->info->domain_attr->mr_mode & FI_MR_ENDPOINT) {
+		rc = fi_mr_bind(mr, &tqpair->ep->fid, access);
+		if (rc == 0) { rc = fi_mr_enable(mr); }
+		if (rc != 0) {
+			SPDK_ERRLOG("ofi host: fi_mr_bind/enable: %s\n", fi_strerror(-rc));
+			fi_close(&mr->fid);
+			return rc;
+		}
+	}
+
+	key = fi_mr_key(mr);
+	addr = (tctrlr->info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) ? (uint64_t)buf : 0;
+
+	e = &tqpair->mr_cache[tqpair->mr_cache_n++];
+	e->buf = buf;
+	e->len = len;
+	e->mr = mr;
+	e->addr = addr;
+	e->key = key;
+	tqpair->mr_reg++;
+
+	*out_addr = addr;
+	*out_key = key;
+	return 0;
+}
+
 static int
 nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *req)
 {
@@ -1200,10 +1333,17 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	if (!tqpair->ep_enabled) {
 		return -EAGAIN;
 	}
-	/* V1 rejects data larger than in-capsule (single-message bound). */
-	if (req->payload_size > NVME_OFI_IN_CAPSULE_DATA_SIZE) {
+	/* V1 (in-capsule) bounds a transfer to one message; V2 (RMA) does not. So
+	 * only reject oversize IO when this controller is NOT using the RMA path. */
+	if (!tqpair->use_rma && req->payload_size > NVME_OFI_IN_CAPSULE_DATA_SIZE) {
 		SPDK_ERRLOG("ofi host: V1 rejects %u-byte IO (> %d in-capsule)\n",
 			    req->payload_size, NVME_OFI_IN_CAPSULE_DATA_SIZE);
+		return -EINVAL;
+	}
+	/* V2 RMA bounce buffer on the target bounds a single transfer to 128 KiB. */
+	if (tqpair->use_rma && req->payload_size > NVME_OFI_RMA_DATA_SIZE) {
+		SPDK_ERRLOG("ofi host: V2 rejects %u-byte IO (> %d RMA ceiling)\n",
+			    req->payload_size, NVME_OFI_RMA_DATA_SIZE);
 		return -EINVAL;
 	}
 
@@ -1237,47 +1377,118 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	}
 	req->cmd.cid = cid;
 
-	/* Direction: FABRIC commands (e.g. CONNECT) carry it in fctype, not opc. */
+	/* Direction: FABRIC commands (e.g. CONNECT) carry it in fctype, not opc. The
+	 * Fabrics CONNECT data is ALWAYS in-capsule (the controller — and any MR it
+	 * could RMA against — does not exist yet), so it never takes the V2 path. */
+	bool is_connect = false;
 	if (req->cmd.opc == SPDK_NVME_OPC_FABRIC) {
 		struct spdk_nvmf_capsule_cmd *fcmd = (struct spdk_nvmf_capsule_cmd *)&req->cmd;
 		xfer = spdk_nvme_opc_get_data_transfer(fcmd->fctype);
+		is_connect = (fcmd->fctype == SPDK_NVMF_FABRIC_COMMAND_CONNECT);
 	} else {
 		xfer = spdk_nvme_opc_get_data_transfer(req->cmd.opc);
 	}
 
-	/* Build the data-transfer SGL descriptor into the SQE. The core does NOT do
-	 * this for fabric transports (nvme_tcp_req_init does, nvme_tcp.c:872-916);
-	 * with a zero-length SGL the target's spdk_nvmf_req_get_xfer() downgrades the
-	 * transfer to NONE and rejects every data command (e.g. IDENTIFY) with
-	 * INVALID_FIELD. V1 is in-capsule only:
-	 *   - HOST_TO_CONTROLLER: data block lives in *this* capsule at offset 0.
-	 *   - CONTROLLER_TO_HOST: transport data block; data rides the response. */
+	bool use_rma = tqpair->use_rma && !is_connect &&
+		       xfer != SPDK_NVME_DATA_NONE && req->payload_size > 0;
+
+	/* The core does NOT build the SGL for fabric transports (nvme_tcp_req_init
+	 * does, nvme_tcp.c:872-916); a zero-length SGL makes the target downgrade the
+	 * transfer to NONE and reject data commands with INVALID_FIELD. */
 	req->cmd.psdt = SPDK_NVME_PSDT_SGL_MPTR_CONTIG;
-	req->cmd.dptr.sgl1.unkeyed.length = req->payload_size;
-	req->cmd.dptr.sgl1.address = 0;
-	if (xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
-		req->cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_DATA_BLOCK;
-		req->cmd.dptr.sgl1.unkeyed.subtype = SPDK_NVME_SGL_SUBTYPE_OFFSET;
-	} else {
-		req->cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_TRANSPORT_DATA_BLOCK;
-		req->cmd.dptr.sgl1.unkeyed.subtype = SPDK_NVME_SGL_SUBTYPE_TRANSPORT;
-	}
 
-	/* Build the capsule: 64B SQE [+ HOST_TO_CONTROLLER data appended]. */
-	memcpy(slot->buf, &req->cmd, sizeof(req->cmd));
-	send_len = sizeof(req->cmd);
+	if (use_rma) {
+		/* V2: advertise a keyed SGL so the target moves the data via RMA. SGL
+		 * payloads (multi-segment) are not yet supported on the host side. */
+		uint64_t rma_addr, rma_key;
+		int mrc;
 
-	if (xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER && req->payload_size > 0) {
 		if (req->payload.reset_sgl_fn != NULL) {
-			/* SGL not supported in V1 (single-segment). */
 			return -EINVAL;
 		}
-		memcpy((char *)slot->buf + sizeof(req->cmd), req->payload.contig_or_cb_arg,
-		       req->payload_size);
-		send_len += req->payload_size;
+		mrc = nvme_ofi_mr_get(tqpair, req->payload.contig_or_cb_arg,
+				      req->payload_size, &rma_addr, &rma_key);
+		if (mrc != 0) {
+			return mrc;
+		}
+		req->cmd.dptr.sgl1.keyed.type = SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK;
+		req->cmd.dptr.sgl1.keyed.subtype = SPDK_NVME_SGL_SUBTYPE_ADDRESS;
+		req->cmd.dptr.sgl1.keyed.length = req->payload_size;
+		req->cmd.dptr.sgl1.keyed.key = rma_key;
+		req->cmd.dptr.sgl1.address = rma_addr;
+
+		/* V2 capsule is the bare 64B SQE — no in-capsule data. */
+		memcpy(slot->buf, &req->cmd, sizeof(req->cmd));
+		send_len = sizeof(req->cmd);
+	} else {
+		/* V1 in-capsule:
+		 *   - HOST_TO_CONTROLLER: data block lives in *this* capsule at offset 0.
+		 *   - CONTROLLER_TO_HOST: transport data block; data rides the response. */
+		req->cmd.dptr.sgl1.unkeyed.length = req->payload_size;
+		req->cmd.dptr.sgl1.address = 0;
+		if (xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
+			req->cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_DATA_BLOCK;
+			req->cmd.dptr.sgl1.unkeyed.subtype = SPDK_NVME_SGL_SUBTYPE_OFFSET;
+		} else {
+			req->cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_TRANSPORT_DATA_BLOCK;
+			req->cmd.dptr.sgl1.unkeyed.subtype = SPDK_NVME_SGL_SUBTYPE_TRANSPORT;
+		}
+
+		/* Build the capsule: 64B SQE [+ HOST_TO_CONTROLLER data appended]. */
+		memcpy(slot->buf, &req->cmd, sizeof(req->cmd));
+		send_len = sizeof(req->cmd);
+
+		if (xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER && req->payload_size > 0) {
+			if (req->payload.reset_sgl_fn != NULL) {
+				/* SGL not supported in V1 (single-segment). */
+				return -EINVAL;
+			}
+			memcpy((char *)slot->buf + sizeof(req->cmd), req->payload.contig_or_cb_arg,
+			       req->payload_size);
+			send_len += req->payload_size;
+		}
 	}
 
 	tag = NVME_OFI_TAG(cid, NVME_OFI_MSG_SQE);
+
+	/* A bare 64B SQE (the V2 RMA path — no in-capsule data) fits the provider's
+	 * inject_size, so send it with fi_injectdata: the SQE is copied inline and
+	 * generates NO TX completion and holds NO send slot. This matters under load:
+	 * the core's resubmit batch (nvme_qpair_resubmit_requests) submits many queued
+	 * requests in a tight loop WITHOUT polling between them, so if each send held a
+	 * slot until its FI_SEND completion (which isn't reaped mid-batch) the 128-slot
+	 * pool would exhaust, submit would -EAGAIN, and the core — which only resubmits
+	 * as many requests as it completed (nvme_qpair.c:905) — would STRAND the rest
+	 * once the transport went idle (the V2 large-IO hang). injectdata removes the
+	 * slot from the hot path entirely. Larger capsules (CONNECT, V1 in-capsule
+	 * data, > inject_size) keep the buffered fi_sendmsg path below.
+	 *
+	 * tcp/sockets are lazy-connect: the first send to a new peer returns -FI_EAGAIN
+	 * while the connection establishes; the provider progresses when its CQ is read,
+	 * so spin a bounded number draining our own CQ between attempts (p0a_findings). */
+	if (send_len <= tqpair->tctrlr->info->tx_attr->inject_size) {
+		int spins = 0;
+		do {
+			rc = fi_injectdata(tqpair->ep, slot->buf, send_len, tag,
+					   tqpair->peer_fi_addr);
+			if (rc != -FI_EAGAIN) {
+				break;
+			}
+			nvme_ofi_drain_cq(tqpair, tqpair->num_slots);
+		} while (++spins < 100000);
+		if (rc == -FI_EAGAIN) {
+			return -EAGAIN;
+		}
+		if (rc != 0) {
+			SPDK_ERRLOG("ofi host: fi_injectdata: %s\n", fi_strerror(-(int)rc));
+			return (int)rc;
+		}
+		/* inject completes inline: no slot held, no tx completion to recycle. The
+		 * cid stays reserved in req_table until the response CQE arrives. */
+		tqpair->req_table[cid] = req;
+		return 0;
+	}
+
 	iov.iov_base = slot->buf;
 	iov.iov_len = send_len;
 	msg.msg_iov = &iov;
@@ -1286,13 +1497,6 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	msg.addr = tqpair->peer_fi_addr;
 	msg.context = slot;
 	msg.data = tag;
-
-	/* tcp/sockets are lazy-connect: the first fi_sendmsg to a new peer returns
-	 * -FI_EAGAIN while the underlying connection is established. The provider
-	 * makes progress when its CQ is read, so spin a bounded number of times
-	 * draining our own CQ between attempts (the prototype's proven pattern —
-	 * p0a_findings). This keeps the connect from stalling when the core does
-	 * not re-drive a queued request (e.g. the reserved Fabrics CONNECT). */
 	{
 		int spins = 0;
 		do {

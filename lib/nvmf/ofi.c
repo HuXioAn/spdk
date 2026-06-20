@@ -39,6 +39,7 @@
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_cm.h>		/* fi_getname */
+#include <rdma/fi_rma.h>		/* fi_read / fi_write (V2 target-initiated RMA) */
 #include <rdma/fi_errno.h>
 
 #include "nvmf_internal.h"
@@ -99,6 +100,10 @@ enum spdk_nvmf_ofi_msg_type {
 
 /* V1 in-capsule data ceiling (caps a single MSG's payload). */
 #define NVMF_OFI_IN_CAPSULE_DATA_SIZE	4096
+/* V2 RMA bounce-buffer ceiling: the per-req local buffer the target fi_read's host
+ * WRITE data into / fi_write's host READ data from. Bounds a single IO's transfer
+ * (design max 128 KiB). Host advertises a keyed SGL; target RMAs into this buffer. */
+#define NVMF_OFI_RMA_DATA_SIZE		131072
 /* Recv buffer: 64B SQE + in-capsule data. Send buffer: 16B CQE + in-capsule data. */
 #define NVMF_OFI_RECV_BUF_SIZE	(sizeof(struct spdk_nvme_cmd) + NVMF_OFI_IN_CAPSULE_DATA_SIZE)
 #define NVMF_OFI_SEND_BUF_SIZE	(sizeof(struct spdk_nvme_cpl) + NVMF_OFI_IN_CAPSULE_DATA_SIZE)
@@ -220,6 +225,11 @@ struct spdk_nvmf_ofi_qpair {
 	struct spdk_nvmf_ofi_recv_slot		*recv_slots;
 	struct spdk_nvmf_ofi_req		*reqs;
 	TAILQ_HEAD(, spdk_nvmf_ofi_req)	free_reqs;
+	/* Reqs whose target-initiated RMA / CQE send hit -FI_EAGAIN (TX queue full);
+	 * retried in poll_group_poll after cq_tx is drained. Each uses the req's `link`
+	 * (a req here is out of free_reqs, and is on at most one list at a time). */
+	TAILQ_HEAD(, spdk_nvmf_ofi_req)	pending_rma;
+	TAILQ_HEAD(, spdk_nvmf_ofi_req)	pending_send;
 	uint32_t				num_slots;	/* == queue depth */
 	bool					pools_ready;
 
@@ -255,10 +265,19 @@ struct spdk_nvmf_ofi_req {
 	void					*send_buf;	/* CQE [+ data] */
 	void					*send_desc;
 	struct fid_mr				*send_mr;
-	void					*data_buf;	/* C2H response buffer (core fills) */
+	void					*data_buf;	/* C2H response buffer (core fills) / V2 RMA bounce */
 	void					*data_desc;
 	struct fid_mr				*data_mr;
 	bool					send_in_flight;
+
+	/* V2 RMA (set per-command from a keyed SGL). When use_rma, the data does NOT
+	 * ride the capsule: the target fi_read's it from / fi_write's it to the host's
+	 * advertised {rma_addr, rma_key} buffer, with data_buf as the local bounce. */
+	bool					use_rma;
+	bool					rma_is_read;	/* deferred-RMA direction (fi_read vs fi_write) */
+	uint64_t				rma_addr;	/* host buffer addr (vaddr or offset) */
+	uint64_t				rma_key;	/* host MR key */
+	uint32_t				cqe_len;	/* CQE capsule length for a deferred send */
 	TAILQ_ENTRY(spdk_nvmf_ofi_req)		link;
 };
 
@@ -1306,6 +1325,141 @@ nvmf_ofi_post_recv(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_recv
 	return 0;
 }
 
+static void nvmf_ofi_send_cqe(struct spdk_nvmf_ofi_req *oreq, uint32_t send_len);
+static void nvmf_ofi_req_release(struct spdk_nvmf_ofi_req *req);
+
+/* Raw RMA issue: fi_read (NVMe WRITE: pull host data into data_buf) or fi_write
+ * (NVMe READ: push data_buf to host). op_context is the req so the cq_tx
+ * completion (FI_READ / FI_WRITE) maps back. Returns the provider rc verbatim. */
+static ssize_t
+nvmf_ofi_issue_rma(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_req *oreq)
+{
+	size_t len = oreq->req.length;
+
+	if (oreq->rma_is_read) {
+		return fi_read(oqpair->ep, oreq->data_buf, len, oreq->data_desc,
+			       oqpair->peer_fi_addr, oreq->rma_addr, oreq->rma_key, oreq);
+	}
+	return fi_write(oqpair->ep, oreq->data_buf, len, oreq->data_desc,
+			oqpair->peer_fi_addr, oreq->rma_addr, oreq->rma_key, oreq);
+}
+
+/*
+ * Post a target-initiated RMA (V2). The op completes asynchronously on cq_tx,
+ * where the poll loop resumes the command (exec after read, send CQE after
+ * write). On -FI_EAGAIN the TX queue is full: with FI_PROGRESS_MANUAL we cannot
+ * spin here (only draining the CQ frees space, and we ARE the poll loop) — so the
+ * req is queued and retried in poll_group_poll after cq_tx is drained. Returns 0
+ * if issued or deferred, negative on a hard error.
+ */
+static int
+nvmf_ofi_post_rma(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_req *oreq,
+		  bool is_read)
+{
+	ssize_t rc;
+
+	oreq->rma_is_read = is_read;
+	rc = nvmf_ofi_issue_rma(oqpair, oreq);
+	if (rc == -FI_EAGAIN) {
+		TAILQ_INSERT_TAIL(&oqpair->pending_rma, oreq, link);
+		return 0;
+	}
+	if (rc != 0) {
+		SPDK_ERRLOG("ofi target: fi_%s: %s\n", is_read ? "read" : "write",
+			    fi_strerror(-(int)rc));
+		return (int)rc;
+	}
+	return 0;
+}
+
+/* Resume a deferred RMA after its completion: NVMe WRITE (fi_read done) execs the
+ * command; NVMe READ (fi_write done) sends the CQE. */
+static void
+nvmf_ofi_rma_done(struct spdk_nvmf_ofi_req *oreq)
+{
+	if (oreq->rma_is_read) {
+		spdk_nvmf_request_exec(&oreq->req);
+	} else {
+		nvmf_ofi_send_cqe(oreq, sizeof(struct spdk_nvme_cpl));
+	}
+}
+
+/* Retry RMAs / CQE sends deferred on a full TX queue. Stops at the first
+ * still-EAGAIN op (queue still full) — order is preserved, and the next poll
+ * (after more cq_tx drains) makes progress. Called from poll_group_poll between
+ * the cq_tx and cq_rx drains. */
+static void
+nvmf_ofi_drain_pending_rma(struct spdk_nvmf_ofi_poll_group *opgroup)
+{
+	struct spdk_nvmf_ofi_qpair *oqpair;
+
+	TAILQ_FOREACH(oqpair, &opgroup->qpairs, link) {
+		struct spdk_nvmf_ofi_req *oreq;
+
+		while ((oreq = TAILQ_FIRST(&oqpair->pending_rma)) != NULL) {
+			ssize_t rc = nvmf_ofi_issue_rma(oqpair, oreq);
+			if (rc == -FI_EAGAIN) {
+				break;
+			}
+			TAILQ_REMOVE(&oqpair->pending_rma, oreq, link);
+			if (rc != 0) {
+				SPDK_ERRLOG("ofi target: deferred fi_%s: %s\n",
+					    oreq->rma_is_read ? "read" : "write",
+					    fi_strerror(-(int)rc));
+				nvmf_ofi_req_release(oreq);
+			}
+			/* success: completes later via cq_tx (FI_READ/FI_WRITE). */
+		}
+	}
+}
+
+/* Raw CQE send: fi_sendmsg the response capsule (CQE [+ V1 data] already in
+ * send_buf), CID in the immediate data. Returns the provider rc. */
+static ssize_t
+nvmf_ofi_issue_send(struct spdk_nvmf_ofi_req *oreq, uint32_t send_len)
+{
+	struct spdk_nvmf_ofi_qpair *oqpair = oreq->oqpair;
+	struct spdk_nvme_cpl *rsp = &oreq->rsp_storage.nvme_cpl;
+	uint64_t tag = SPDK_NVMF_OFI_BUILD_TAG(rsp->cid, SPDK_NVMF_OFI_MSG_CQE);
+	struct iovec iov;
+	struct fi_msg msg = {0};
+
+	iov.iov_base = oreq->send_buf;
+	iov.iov_len = send_len;
+	msg.msg_iov = &iov;
+	msg.desc = &oreq->send_desc;
+	msg.iov_count = 1;
+	msg.addr = oqpair->peer_fi_addr;
+	msg.context = oreq;
+	msg.data = tag;
+	return fi_sendmsg(oqpair->ep, &msg, FI_REMOTE_CQ_DATA | FI_COMPLETION);
+}
+
+static void
+nvmf_ofi_drain_pending_send(struct spdk_nvmf_ofi_poll_group *opgroup)
+{
+	struct spdk_nvmf_ofi_qpair *oqpair;
+
+	TAILQ_FOREACH(oqpair, &opgroup->qpairs, link) {
+		struct spdk_nvmf_ofi_req *oreq;
+
+		while ((oreq = TAILQ_FIRST(&oqpair->pending_send)) != NULL) {
+			ssize_t rc = nvmf_ofi_issue_send(oreq, oreq->cqe_len);
+			if (rc == -FI_EAGAIN) {
+				break;
+			}
+			TAILQ_REMOVE(&oqpair->pending_send, oreq, link);
+			if (rc != 0) {
+				SPDK_ERRLOG("ofi target: deferred response fi_sendmsg: %s\n",
+					    fi_strerror(-(int)rc));
+				nvmf_ofi_req_release(oreq);
+			} else {
+				oreq->send_in_flight = true;
+			}
+		}
+	}
+}
+
 static struct spdk_nvmf_ofi_req *
 nvmf_ofi_req_get(struct spdk_nvmf_ofi_qpair *oqpair)
 {
@@ -1394,6 +1548,8 @@ nvmf_ofi_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	oqpair->num_slots = qd;
 	oqpair->mr_local = (otransport->info->domain_attr->mr_mode & FI_MR_LOCAL) != 0;
 	TAILQ_INIT(&oqpair->free_reqs);
+	TAILQ_INIT(&oqpair->pending_rma);
+	TAILQ_INIT(&oqpair->pending_send);
 
 	oqpair->recv_slots = calloc(qd, sizeof(*oqpair->recv_slots));
 	oqpair->reqs = calloc(qd, sizeof(*oqpair->reqs));
@@ -1411,7 +1567,11 @@ nvmf_ofi_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 		rq->oqpair = oqpair;
 		rq->send_buf = spdk_zmalloc(NVMF_OFI_SEND_BUF_SIZE, 0, NULL,
 					    SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
-		rq->data_buf = spdk_zmalloc(NVMF_OFI_IN_CAPSULE_DATA_SIZE, 0, NULL,
+		/* data_buf doubles as the V2 RMA bounce buffer (target is the RMA
+		 * initiator), so it is sized to the RMA ceiling and registered FI_READ|
+		 * FI_WRITE — FI_READ so fi_read can land into it, FI_WRITE so fi_write can
+		 * source from it. */
+		rq->data_buf = spdk_zmalloc(NVMF_OFI_RMA_DATA_SIZE, 0, NULL,
 					    SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 		if (rs->buf == NULL || rq->send_buf == NULL || rq->data_buf == NULL) {
 			rc = -ENOMEM;
@@ -1422,7 +1582,7 @@ nvmf_ofi_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 				  FI_RECV, 0, 0, 0, &rs->mr, NULL);
 			fi_mr_reg(opgroup->domain, rq->send_buf, NVMF_OFI_SEND_BUF_SIZE,
 				  FI_SEND, 0, 0, 0, &rq->send_mr, NULL);
-			fi_mr_reg(opgroup->domain, rq->data_buf, NVMF_OFI_IN_CAPSULE_DATA_SIZE,
+			fi_mr_reg(opgroup->domain, rq->data_buf, NVMF_OFI_RMA_DATA_SIZE,
 				  FI_READ | FI_WRITE, 0, 0, 0, &rq->data_mr, NULL);
 			rs->desc = rs->mr ? fi_mr_desc(rs->mr) : NULL;
 			rq->send_desc = rq->send_mr ? fi_mr_desc(rq->send_mr) : NULL;
@@ -1504,13 +1664,30 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 		}
 		reaped++;
 		{
-			/* TX completion: a response MSG was sent — recycle its req
-			 * (this also re-posts the recv slot the req was holding). */
-			struct spdk_nvmf_ofi_req *req = entry.op_context;
-			req->send_in_flight = false;
-			nvmf_ofi_req_release(req);
+			/* TX completion. Three kinds land on cq_tx, distinguished by the
+			 * op flags (the op_context is always the req):
+			 *  - FI_READ : a V2 fi_read finished — host WRITE data is now in
+			 *    data_buf; exec the command (was deferred at recv time).
+			 *  - FI_WRITE: a V2 fi_write finished — host READ data has landed in
+			 *    host memory (RC TRANSMIT_COMPLETE ⇒ delivered, p0b_findings);
+			 *    now send the CQE.
+			 *  - else (FI_SEND): the response MSG was sent — recycle the req
+			 *    (this also re-posts the recv slot it was holding). */
+			struct spdk_nvmf_ofi_req *oreq = entry.op_context;
+
+			if (entry.flags & (FI_READ | FI_WRITE)) {
+				nvmf_ofi_rma_done(oreq);
+			} else {
+				oreq->send_in_flight = false;
+				nvmf_ofi_req_release(oreq);
+			}
 		}
 	}
+
+	/* cq_tx drained ⇒ TX queue space freed; retry any RMA / CQE send deferred on
+	 * -FI_EAGAIN before receiving new commands (which may defer more). */
+	nvmf_ofi_drain_pending_rma(opgroup);
+	nvmf_ofi_drain_pending_send(opgroup);
 
 	/* Then drain rx completions: receive + execute new commands. */
 	while (reaped < 64) {
@@ -1553,8 +1730,47 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			req->req.qpair = &oqpair->qpair;
 			req->req.xfer = spdk_nvmf_req_get_xfer(&req->req);
 			req->recv_slot = slot;	/* hold the slot for zero-copy H2C data */
+			req->use_rma = false;
 			SPDK_DEBUGLOG(nvmf_ofi, "ofi target: recv cmd opc=0x%x cid=%u len=%zu xfer=%u\n",
 				       sqe->opc, sqe->cid, entry.len, req->req.xfer);
+
+			/* V2: a keyed SGL means the host advertised a remote buffer; the data
+			 * moves over target-initiated RMA, not in-capsule. (V1's DATA_BLOCK /
+			 * TRANSPORT_DATA_BLOCK SGLs keep the in-capsule path below.) The SGL
+			 * type field overlays at the same bits across keyed/unkeyed/generic. */
+			if (req->req.cmd->nvme_cmd.dptr.sgl1.generic.type ==
+			    SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK) {
+				struct spdk_nvme_sgl_descriptor *sgl =
+					&req->req.cmd->nvme_cmd.dptr.sgl1;
+				uint32_t rlen = sgl->keyed.length;
+
+				if (rlen > NVMF_OFI_RMA_DATA_SIZE) {
+					SPDK_WARNLOG("ofi target: RMA len %u > %d ceiling, clamping\n",
+						     rlen, NVMF_OFI_RMA_DATA_SIZE);
+					rlen = NVMF_OFI_RMA_DATA_SIZE;
+				}
+				req->use_rma = true;
+				req->rma_addr = sgl->address;
+				req->rma_key = sgl->keyed.key;
+				req->req.iov[0].iov_base = req->data_buf;
+				req->req.iov[0].iov_len = rlen;
+				req->req.length = rlen;
+				req->req.iovcnt = 1;
+				req->req.data_from_pool = false;
+
+				if (req->req.xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
+					/* WRITE: pull host data into data_buf, THEN exec (on the
+					 * fi_read completion in the cq_tx drain). */
+					if (nvmf_ofi_post_rma(oqpair, req, true) != 0) {
+						nvmf_ofi_req_release(req);
+					}
+					continue;
+				}
+				/* READ (or no-data keyed): exec now; the fi_write to push the
+				 * result to the host happens in req_complete. */
+				spdk_nvmf_request_exec(&req->req);
+				continue;
+			}
 
 			if (entry.len > sizeof(struct spdk_nvme_cmd)) {
 				/* HOST_TO_CONTROLLER in-capsule data (e.g. CONNECT/WRITE). */
@@ -1646,45 +1862,22 @@ nvmf_ofi_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 }
 
 /*
- * The core finished a command; send the response. The response is a single MSG
- * carrying the 16B CQE [+ CONTROLLER_TO_HOST data appended]. The data (for a
- * successful READ/Identify/GetLog) was filled by the core into req->iov.
+ * Send the response capsule (already built in oreq->send_buf: 16B CQE [+ V1 C2H
+ * data]). send_len is the capsule length. The CID rides the CQ immediate data as
+ * the tag. The req is recycled on the FI_SEND tx completion (poll_group_poll).
  */
 static void
-nvmf_ofi_req_complete(struct spdk_nvmf_request *req)
+nvmf_ofi_send_cqe(struct spdk_nvmf_ofi_req *oreq, uint32_t send_len)
 {
-	struct spdk_nvmf_ofi_req *oreq = SPDK_CONTAINEROF(req, struct spdk_nvmf_ofi_req, req);
-	struct spdk_nvmf_ofi_qpair *oqpair = oreq->oqpair;
-	struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
-	uint64_t tag = SPDK_NVMF_OFI_BUILD_TAG(rsp->cid, SPDK_NVMF_OFI_MSG_CQE);
-	uint32_t send_len = sizeof(struct spdk_nvme_cpl);
-	struct iovec iov;
-	struct fi_msg msg = {0};
-	ssize_t rc;
+	ssize_t rc = nvmf_ofi_issue_send(oreq, send_len);
 
-	SPDK_DEBUGLOG(nvmf_ofi, "ofi target: req_complete cid=%u sct=%u sc=%u xfer=%u len=%u\n",
-		       rsp->cid, rsp->status.sct, rsp->status.sc, req->xfer, req->length);
-
-	/* Build the response capsule: CQE first, then any C2H data. */
-	memcpy(oreq->send_buf, rsp, sizeof(*rsp));
-	if (spdk_nvme_cpl_is_success(rsp) &&
-	    req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST && req->length > 0 &&
-	    req->iovcnt > 0) {
-		uint32_t dlen = spdk_min(req->length, NVMF_OFI_IN_CAPSULE_DATA_SIZE);
-		memcpy((char *)oreq->send_buf + sizeof(*rsp), req->iov[0].iov_base, dlen);
-		send_len += dlen;
+	if (rc == -FI_EAGAIN) {
+		/* TX queue full — defer (see post_rma); retried in poll_group_poll.
+		 * Dropping here would lose the CQE and hang the host on that command. */
+		oreq->cqe_len = send_len;
+		TAILQ_INSERT_TAIL(&oreq->oqpair->pending_send, oreq, link);
+		return;
 	}
-
-	iov.iov_base = oreq->send_buf;
-	iov.iov_len = send_len;
-	msg.msg_iov = &iov;
-	msg.desc = &oreq->send_desc;
-	msg.iov_count = 1;
-	msg.addr = oqpair->peer_fi_addr;
-	msg.context = oreq;
-	msg.data = tag;
-
-	rc = fi_sendmsg(oqpair->ep, &msg, FI_REMOTE_CQ_DATA | FI_COMPLETION);
 	if (rc != 0) {
 		SPDK_ERRLOG("ofi target: response fi_sendmsg: %s\n", fi_strerror(-(int)rc));
 		/* Drop the request so the slot can be re-posted. */
@@ -1692,7 +1885,54 @@ nvmf_ofi_req_complete(struct spdk_nvmf_request *req)
 		return;
 	}
 	oreq->send_in_flight = true;
-	/* The req is recycled on the tx completion (poll_group_poll). */
+}
+
+/*
+ * The core finished a command. Build the CQE and deliver the response. V1: the
+ * CQE [+ C2H data] is a single MSG. V2 (use_rma): a successful CONTROLLER_TO_HOST
+ * read first pushes the data to the host over fi_write — and only sends the CQE
+ * once that write completes (cq_tx FI_WRITE → nvmf_ofi_send_cqe), so the host
+ * sees the CQE strictly after its buffer is filled. H2C / no-data just send the
+ * CQE (the WRITE data was already fi_read before exec).
+ */
+static void
+nvmf_ofi_req_complete(struct spdk_nvmf_request *req)
+{
+	struct spdk_nvmf_ofi_req *oreq = SPDK_CONTAINEROF(req, struct spdk_nvmf_ofi_req, req);
+	struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
+	uint32_t send_len = sizeof(struct spdk_nvme_cpl);
+
+	SPDK_DEBUGLOG(nvmf_ofi, "ofi target: req_complete cid=%u sct=%u sc=%u xfer=%u len=%u rma=%d\n",
+		       rsp->cid, rsp->status.sct, rsp->status.sc, req->xfer, req->length,
+		       oreq->use_rma);
+
+	/* Build the CQE into the send buffer. */
+	memcpy(oreq->send_buf, rsp, sizeof(*rsp));
+
+	if (oreq->use_rma) {
+		/* V2: data (if any) moves over RMA, never in-capsule. */
+		if (spdk_nvme_cpl_is_success(rsp) &&
+		    req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST && req->length > 0 &&
+		    req->iovcnt > 0) {
+			/* Push the read result to the host, send the CQE on completion. */
+			if (nvmf_ofi_post_rma(oreq->oqpair, oreq, false) == 0) {
+				return;
+			}
+			/* fi_write failed: fall through and report the CQE as-is. */
+		}
+		nvmf_ofi_send_cqe(oreq, send_len);
+		return;
+	}
+
+	/* V1: append any C2H data in-capsule. */
+	if (spdk_nvme_cpl_is_success(rsp) &&
+	    req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST && req->length > 0 &&
+	    req->iovcnt > 0) {
+		uint32_t dlen = spdk_min(req->length, NVMF_OFI_IN_CAPSULE_DATA_SIZE);
+		memcpy((char *)oreq->send_buf + sizeof(*rsp), req->iov[0].iov_base, dlen);
+		send_len += dlen;
+	}
+	nvmf_ofi_send_cqe(oreq, send_len);
 }
 
 /* Core-initiated free (abort / qpair teardown path). Recycle the req. */
