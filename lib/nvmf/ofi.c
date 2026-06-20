@@ -825,9 +825,9 @@ nvmf_ofi_ep_setup_on_pg(void *ctx)
 	}
 	oqpair->peer_fi_addr = peer;
 
-	SPDK_INFOLOG(nvmf_ofi, "EP up on pg thread %s: local_addr_len=%zu peer_fi_addr=0x%lx\n",
-		     spdk_thread_get_name(pg->thread), conn->local_ep_addr_len,
-		     (unsigned long)peer);
+	SPDK_INFOLOG(nvmf_ofi, "EP up on pg thread %s: peer=%s:%u local_addr_len=%zu peer_fi_addr=0x%lx\n",
+		     spdk_thread_get_name(pg->thread), conn->peer_addr, conn->peer_port,
+		     conn->local_ep_addr_len, (unsigned long)peer);
 	rc = 0;
 
 out:

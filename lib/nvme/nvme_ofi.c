@@ -220,6 +220,8 @@ struct nvme_ofi_qpair {
 	/* libfabric endpoint + peer (created in connect_qpair). */
 	struct fid_ep			*ep;
 	struct fid_cq			*cq;		/* per-qpair tx+rx CQ */
+	struct fid_domain		*domain;	/* #45: per-qpair. Each qpair runs on its own core; sharing one ctrlr->domain violated FI_THREAD_DOMAIN and serialized ofi_rxm MANUAL progress across cores. */
+	struct fid_av			*av;		/* per-qpair AV on that domain */
 	fi_addr_t			peer_fi_addr;
 	bool				ep_enabled;
 	bool				mr_local;
@@ -265,8 +267,6 @@ struct nvme_ofi_ctrlr {
 
 	struct fi_info			*info;
 	struct fid_fabric		*fabric;
-	struct fid_domain		*domain;
-	struct fid_av			*av;
 
 	char				provider[32];
 	bool				use_rma;	/* OFI_RMA env: V2 data path (default on) */
@@ -501,8 +501,8 @@ nvme_ofi_sb_rx_consume(struct nvme_ofi_qpair *tqpair, size_t frame_len)
 static void
 nvme_ofi_ep_teardown(struct nvme_ofi_qpair *tqpair)
 {
-	if (tqpair->peer_fi_addr != FI_ADDR_NOTAVAIL && tqpair->tctrlr->av != NULL) {
-		fi_av_remove(tqpair->tctrlr->av, &tqpair->peer_fi_addr, 1, 0);
+	if (tqpair->peer_fi_addr != FI_ADDR_NOTAVAIL && tqpair->av != NULL) {
+		fi_av_remove(tqpair->av, &tqpair->peer_fi_addr, 1, 0);
 		tqpair->peer_fi_addr = FI_ADDR_NOTAVAIL;
 	}
 	if (tqpair->ep != NULL) {
@@ -522,7 +522,7 @@ nvme_ofi_ep_create(struct nvme_ofi_qpair *tqpair)
 	size_t addrlen;
 	int rc;
 
-	rc = fi_endpoint(tctrlr->domain, tctrlr->info, &tqpair->ep, NULL);
+	rc = fi_endpoint(tqpair->domain, tctrlr->info, &tqpair->ep, NULL);
 	if (rc != 0) {
 		SPDK_ERRLOG("ofi host: fi_endpoint: %s\n", fi_strerror(-rc));
 		return rc;
@@ -553,7 +553,7 @@ nvme_ofi_ep_create(struct nvme_ofi_qpair *tqpair)
 			}
 		}
 	}
-	rc = fi_ep_bind(tqpair->ep, &tctrlr->av->fid, 0);
+	rc = fi_ep_bind(tqpair->ep, &tqpair->av->fid, 0);
 	if (rc != 0) { goto err; }
 	/* The host uses a single CQ for tx and rx (a host qpair has its own completion
 	 * stream; binding both flags to one CQ is fine for manual poll). A target
@@ -679,8 +679,12 @@ nvme_ofi_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 			     tctrlr->use_rma ? "V2 (target RMA)" : "V1 (in-capsule)");
 	}
 
-	/* Per-ctrlr (== per-domain) libfabric resources. Created up-front so every
-	 * qpair on this ctrlr shares the domain/av; the EP is per-qpair. */
+	/* Per-ctrlr libfabric: just the info + fabric. The domain + AV are per-QPAIR
+	 * now (created in create_io_qpair): a controller's IO qpairs run on separate
+	 * cores, and sharing one ctrlr->domain both violated the FI_THREAD_DOMAIN
+	 * contract (provider assumes single-threaded domain access) and serialized
+	 * ofi_rxm's MANUAL progress across cores (#45). Each qpair owning its domain
+	 * restores independent per-core progress. */
 	rc = nvme_ofi_getinfo(tctrlr->provider, &tctrlr->info);
 	if (rc != 0) {
 		goto err_info;
@@ -689,18 +693,6 @@ nvme_ofi_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 	if (rc != 0) {
 		SPDK_ERRLOG("ofi host: fi_fabric: %s\n", fi_strerror(-rc));
 		goto err_fabric;
-	}
-	rc = fi_domain(tctrlr->fabric, tctrlr->info, &tctrlr->domain, NULL);
-	if (rc != 0) {
-		SPDK_ERRLOG("ofi host: fi_domain: %s\n", fi_strerror(-rc));
-		goto err_domain;
-	}
-	struct fi_av_attr av_attr = {0};
-	av_attr.type = FI_AV_MAP;
-	rc = fi_av_open(tctrlr->domain, &av_attr, &tctrlr->av, NULL);
-	if (rc != 0) {
-		SPDK_ERRLOG("ofi host: fi_av_open: %s\n", fi_strerror(-rc));
-		goto err_av;
 	}
 
 	rc = nvme_ctrlr_construct(&tctrlr->ctrlr);
@@ -726,10 +718,6 @@ nvme_ofi_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 	return &tctrlr->ctrlr;
 
 err_core:
-	fi_close(&tctrlr->av->fid);
-err_av:
-	fi_close(&tctrlr->domain->fid);
-err_domain:
 	fi_close(&tctrlr->fabric->fid);
 err_fabric:
 	fi_freeinfo(tctrlr->info);
@@ -743,9 +731,8 @@ nvme_ofi_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
 {
 	struct nvme_ofi_ctrlr *tctrlr = nvme_ofi_ctrlr(ctrlr);
 
-	/* The core closes qpairs first; here we drop the per-ctrlr libfabric objects. */
-	if (tctrlr->av) { fi_close(&tctrlr->av->fid); }
-	if (tctrlr->domain) { fi_close(&tctrlr->domain->fid); }
+	/* The core closes qpairs (each owns its domain + AV) first; here we drop the
+	 * per-ctrlr fabric + info. */
 	if (tctrlr->fabric) { fi_close(&tctrlr->fabric->fid); }
 	if (tctrlr->info) { fi_freeinfo(tctrlr->info); }
 
@@ -832,11 +819,26 @@ nvme_ofi_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 	tqpair->req_table_sz = num_requests;
 	tqpair->use_rma = tctrlr->use_rma;
 
+	/* #45: per-qpair domain + AV (see ctrlr_construct). Must precede the CQ and
+	 * the EP (which binds both). */
+	rc = fi_domain(tctrlr->fabric, tctrlr->info, &tqpair->domain, NULL);
+	if (rc != 0) {
+		SPDK_ERRLOG("ofi host: fi_domain: %s\n", fi_strerror(-rc));
+		goto err;
+	}
+	struct fi_av_attr av_attr = {0};
+	av_attr.type = FI_AV_MAP;
+	rc = fi_av_open(tqpair->domain, &av_attr, &tqpair->av, NULL);
+	if (rc != 0) {
+		SPDK_ERRLOG("ofi host: fi_av_open: %s\n", fi_strerror(-rc));
+		goto err;
+	}
+
 	/* One CQ per qpair (tx+rx bound to it). */
 	cq_attr.size = qsize * 2;
 	cq_attr.format = FI_CQ_FORMAT_DATA;	/* need .data for the cid tag */
 	cq_attr.wait_obj = FI_WAIT_NONE;
-	rc = fi_cq_open(tctrlr->domain, &cq_attr, &tqpair->cq, NULL);
+	rc = fi_cq_open(tqpair->domain, &cq_attr, &tqpair->cq, NULL);
 	if (rc != 0) {
 		SPDK_ERRLOG("ofi host: fi_cq_open: %s\n", fi_strerror(-rc));
 		goto err;
@@ -862,10 +864,10 @@ nvme_ofi_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 			goto err;
 		}
 		if (tqpair->mr_local) {
-			fi_mr_reg(tctrlr->domain, tqpair->recv_slots[i].buf,
+			fi_mr_reg(tqpair->domain, tqpair->recv_slots[i].buf,
 				  NVME_OFI_RECV_BUF_SIZE, FI_RECV, 0, 0, 0,
 				  &tqpair->recv_slots[i].mr, NULL);
-			fi_mr_reg(tctrlr->domain, tqpair->send_slots[i].buf,
+			fi_mr_reg(tqpair->domain, tqpair->send_slots[i].buf,
 				  NVME_OFI_SEND_BUF_SIZE, FI_SEND, 0, 0, 0,
 				  &tqpair->send_slots[i].mr, NULL);
 			tqpair->recv_slots[i].desc = tqpair->recv_slots[i].mr ?
@@ -916,6 +918,8 @@ nvme_ofi_qpair_free_res(struct nvme_ofi_qpair *tqpair)
 		}
 	}
 	if (tqpair->cq) { fi_close(&tqpair->cq->fid); }
+	if (tqpair->av) { fi_close(&tqpair->av->fid); }
+	if (tqpair->domain) { fi_close(&tqpair->domain->fid); }
 	free(tqpair);
 }
 
@@ -1108,7 +1112,7 @@ nvme_ofi_connect_poll(struct nvme_ofi_qpair *tqpair)
 			       tqpair->peer_ep_addr_len);
 			{
 				fi_addr_t peer = FI_ADDR_NOTAVAIL;
-				ssize_t ni = fi_av_insert(tqpair->tctrlr->av, tqpair->peer_ep_addr,
+				ssize_t ni = fi_av_insert(tqpair->av, tqpair->peer_ep_addr,
 							  1, &peer, 0, NULL);
 				if (ni != 1) {
 					SPDK_ERRLOG("ofi host: fi_av_insert: %zd\n", ni);
@@ -1303,7 +1307,7 @@ nvme_ofi_mr_get(struct nvme_ofi_qpair *tqpair, void *buf, size_t len,
 	}
 
 	req_key = prov_key ? 0 : __atomic_fetch_add(&tctrlr->mr_next_key, 1, __ATOMIC_RELAXED);
-	rc = fi_mr_reg(tctrlr->domain, buf, len, access, 0, req_key, 0, &mr, NULL);
+	rc = fi_mr_reg(tqpair->domain, buf, len, access, 0, req_key, 0, &mr, NULL);
 	if (rc != 0) {
 		SPDK_ERRLOG("ofi host: fi_mr_reg (remote data): %s\n", fi_strerror(-rc));
 		return rc;
