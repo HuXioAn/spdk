@@ -901,7 +901,9 @@ nvme_ofi_drain_cq(struct nvme_ofi_qpair *tqpair, uint32_t max_completions)
 		if (rc == -FI_EAVAIL) {
 			memset(&err, 0, sizeof(err));
 			fi_cq_readerr(tqpair->cq, &err, 0);
-			SPDK_ERRLOG("ofi host: CQ error err=%d prov=%d\n", err.err, err.prov_errno);
+			SPDK_ERRLOG("ofi host: CQ error err=%d(%s) prov=%d flags=0x%lx len=%zu olen=%zu\n",
+				    err.err, fi_strerror(err.err), err.prov_errno,
+				    (unsigned long)err.flags, err.len, err.olen);
 			nvme_ctrlr_disconnect_qpair(&tqpair->qpair);
 			return -ENXIO;
 		}
@@ -927,7 +929,12 @@ nvme_ofi_drain_cq(struct nvme_ofi_qpair *tqpair, uint32_t max_completions)
 				nvme_ofi_complete_request(tqpair, cid, cpl, data, data_len);
 			}
 			slot->posted = false;
-			nvme_ofi_post_recv(tqpair, slot);
+			if (nvme_ofi_post_recv(tqpair, slot) != 0) {
+				/* Re-post failed (provider -FI_EAGAIN). The recv buffer stays
+				 * unposted; with the tcp provider this is transient and rare,
+				 * but a permanent leak would starve the recv pool over time. */
+				SPDK_WARNLOG("ofi host: recv re-post failed (slot leaked)\n");
+			}
 		} else {
 			struct nvme_ofi_send_slot *slot = entry.op_context;
 			slot->busy = false;
@@ -1061,7 +1068,13 @@ nvme_ofi_connect_poll(struct nvme_ofi_qpair *tqpair)
 			for (i = 0; i < tqpair->num_slots; i++) {
 				nvme_ofi_post_recv(tqpair, &tqpair->recv_slots[i]);
 			}
-			num_entries = tqpair->num_slots + 1;
+			/* Fabrics CONNECT carries SQSIZE = num_entries - 1 (0-based). Our
+			 * queue holds num_slots entries, so SQSIZE must be num_slots - 1,
+			 * i.e. pass num_entries = num_slots. (nvme_rdma reaches the same
+			 * result by keeping num_entries = qsize-1 then passing +1.) Passing
+			 * num_slots+1 here overshoots SQSIZE by one and the target rejects
+			 * the IO qpair with "Invalid SQSIZE" / sc=0x82 once num_slots == MQES+1. */
+			num_entries = tqpair->num_slots;
 			rc = nvme_fabric_qpair_connect_async(qpair, num_entries);
 			if (rc != 0) {
 				SPDK_ERRLOG("ofi host: fabric connect_async: %d\n", rc);
@@ -1148,13 +1161,18 @@ nvme_ofi_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 {
 	struct nvme_ofi_qpair *tqpair = nvme_ofi_qpair(qpair);
 
+	/* The core polls process_completions while the qpair is DISCONNECTING and
+	 * waits for it to reach DISCONNECTED (nvme_ctrlr.c:618). Our EP teardown is
+	 * synchronous, so tear everything down and advance straight to DISCONNECTED
+	 * before returning — otherwise the core spins forever. */
+	nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTING);
 	nvme_ofi_ep_teardown(tqpair);
 	if (tqpair->sb_sock) {
 		spdk_sock_close(&tqpair->sb_sock);
 		tqpair->sb_sock = NULL;
 	}
 	tqpair->sb_state = NVME_OFI_SB_INIT;
-	nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTING);
+	nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTED);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1167,7 +1185,7 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	struct nvme_ofi_qpair *tqpair = nvme_ofi_qpair(qpair);
 	struct nvme_ofi_send_slot *slot = NULL;
 	enum spdk_nvme_data_transfer xfer;
-	uint16_t cid = req->cmd.cid;
+	uint16_t cid;
 	uint64_t tag;
 	uint32_t i, send_len;
 	struct iovec iov;
@@ -1176,9 +1194,6 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 
 	if (!tqpair->ep_enabled) {
 		return -EAGAIN;
-	}
-	if (cid >= tqpair->req_table_sz) {
-		return -EINVAL;
 	}
 	/* V1 rejects data larger than in-capsule (single-message bound). */
 	if (req->payload_size > NVME_OFI_IN_CAPSULE_DATA_SIZE) {
@@ -1197,9 +1212,25 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 		return -EAGAIN;	/* no send slot; core will retry */
 	}
 
-	/* Build the capsule: 64B SQE [+ HOST_TO_CONTROLLER data appended]. */
-	memcpy(slot->buf, &req->cmd, sizeof(req->cmd));
-	send_len = sizeof(req->cmd);
+	/* Allocate a unique command id. The core does NOT set cmd.cid for fabric
+	 * transports (nvme_tcp assigns it from the tcp_req index, nvme_tcp.c:872);
+	 * leaving it 0 makes every command collide on req_table[0], which silently
+	 * loses one of any two concurrently-outstanding commands (e.g. an in-flight
+	 * AER vs the next admin command during init). The cid must stay reserved
+	 * until the *response* arrives, so allocate it from req_table (an entry is
+	 * "in use" while non-NULL), NOT from the send-slot index — a send slot frees
+	 * on its tx completion, which can land before the response CQE. */
+	cid = UINT16_MAX;
+	for (i = 0; i < tqpair->req_table_sz; i++) {
+		if (tqpair->req_table[i] == NULL) {
+			cid = (uint16_t)i;
+			break;
+		}
+	}
+	if (cid == UINT16_MAX) {
+		return -EAGAIN;	/* no free cid; core will retry */
+	}
+	req->cmd.cid = cid;
 
 	/* Direction: FABRIC commands (e.g. CONNECT) carry it in fctype, not opc. */
 	if (req->cmd.opc == SPDK_NVME_OPC_FABRIC) {
@@ -1208,6 +1239,29 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	} else {
 		xfer = spdk_nvme_opc_get_data_transfer(req->cmd.opc);
 	}
+
+	/* Build the data-transfer SGL descriptor into the SQE. The core does NOT do
+	 * this for fabric transports (nvme_tcp_req_init does, nvme_tcp.c:872-916);
+	 * with a zero-length SGL the target's spdk_nvmf_req_get_xfer() downgrades the
+	 * transfer to NONE and rejects every data command (e.g. IDENTIFY) with
+	 * INVALID_FIELD. V1 is in-capsule only:
+	 *   - HOST_TO_CONTROLLER: data block lives in *this* capsule at offset 0.
+	 *   - CONTROLLER_TO_HOST: transport data block; data rides the response. */
+	req->cmd.psdt = SPDK_NVME_PSDT_SGL_MPTR_CONTIG;
+	req->cmd.dptr.sgl1.unkeyed.length = req->payload_size;
+	req->cmd.dptr.sgl1.address = 0;
+	if (xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
+		req->cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_DATA_BLOCK;
+		req->cmd.dptr.sgl1.unkeyed.subtype = SPDK_NVME_SGL_SUBTYPE_OFFSET;
+	} else {
+		req->cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_TRANSPORT_DATA_BLOCK;
+		req->cmd.dptr.sgl1.unkeyed.subtype = SPDK_NVME_SGL_SUBTYPE_TRANSPORT;
+	}
+
+	/* Build the capsule: 64B SQE [+ HOST_TO_CONTROLLER data appended]. */
+	memcpy(slot->buf, &req->cmd, sizeof(req->cmd));
+	send_len = sizeof(req->cmd);
+
 	if (xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER && req->payload_size > 0) {
 		if (req->payload.reset_sgl_fn != NULL) {
 			/* SGL not supported in V1 (single-segment). */
@@ -1310,8 +1364,11 @@ nvme_ofi_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr)
 static int
 nvme_ofi_qpair_reset(struct spdk_nvme_qpair *qpair)
 {
-	nvme_ctrlr_disconnect_qpair(qpair);
-	/* The core will reconnect. */
+	/* No-op, matching nvme_tcp/nvme_rdma. The core calls this from
+	 * NVME_CTRLR_STATE_RESET_ADMIN_QUEUE and then transitions straight to
+	 * IDENTIFY *without* reconnecting — so the admin qpair (and its EP) must
+	 * stay up. Disconnecting here tears down the EP and makes the very next
+	 * IDENTIFY submit fail with -ENXIO (controller init -> ERROR). */
 	return 0;
 }
 
@@ -1374,6 +1431,25 @@ nvme_ofi_poll_group_add(struct spdk_nvme_transport_poll_group *group,
 			struct spdk_nvme_qpair *qpair)
 {
 	qpair->poll_group = group;
+	return 0;
+}
+
+/* Connect/disconnect within a poll group. The real connect is initiated by
+ * ctrlr_connect_qpair and driven by poll_group_process_completions (which calls
+ * qpair_process_completions -> connect_poll while CONNECTING); each qpair owns
+ * its own EP+CQ and sideband sock, so there is no shared sock-group membership
+ * to maintain here. Both are no-ops (matching nvme_tcp_poll_group_connect_qpair).
+ * NOTE: without poll_group_connect_qpair the core dereferences a NULL op pointer
+ * when connecting an IO qpair (nvme_transport.c:852). */
+static int
+nvme_ofi_poll_group_connect_qpair(struct spdk_nvme_qpair *qpair)
+{
+	return 0;
+}
+
+static int
+nvme_ofi_poll_group_disconnect_qpair(struct spdk_nvme_qpair *qpair)
+{
 	return 0;
 }
 
@@ -1450,6 +1526,8 @@ const struct spdk_nvme_transport_ops nvme_ofi_ops = {
 	.admin_qpair_abort_aers = nvme_ofi_admin_qpair_abort_aers,
 
 	.poll_group_create = nvme_ofi_poll_group_create,
+	.poll_group_connect_qpair = nvme_ofi_poll_group_connect_qpair,
+	.poll_group_disconnect_qpair = nvme_ofi_poll_group_disconnect_qpair,
 	.poll_group_add = nvme_ofi_poll_group_add,
 	.poll_group_remove = nvme_ofi_poll_group_remove,
 	.poll_group_process_completions = nvme_ofi_poll_group_process_completions,

@@ -1362,22 +1362,14 @@ nvmf_ofi_qpair_free_pools(struct spdk_nvmf_ofi_qpair *oqpair)
 	oqpair->pools_ready = false;
 }
 
-/* Best-effort C2H data length from the command (admin NUMD / IO SGL), clamped to
- * the in-capsule ceiling. Good enough for V1 admin responses (Identify/GetLog). */
+/* C2H data length from the command's SGL descriptor, clamped to the in-capsule
+ * ceiling. The host populates sgl1.unkeyed.length with the transfer size for
+ * every data command (matching nvme_tcp_req_init), so this is authoritative for
+ * both admin (Identify/GetLog) and IO reads — no opcode special-casing needed. */
 static uint32_t
 nvmf_ofi_cmd_data_len(const union nvmf_h2c_msg *cmd)
 {
-	const struct spdk_nvme_cmd *c = &cmd->nvme_cmd;
-	uint32_t len;
-
-	if (c->opc == SPDK_NVME_OPC_FABRIC || c->opc == SPDK_NVME_OPC_IDENTIFY ||
-	    c->opc == SPDK_NVME_OPC_GET_LOG_PAGE) {
-		/* NUMD (dwords-1) is in cdw10 for these; length = (NUMD+1)*4. */
-		len = (c->cdw10 + 1) << 2;
-	} else {
-		len = c->dptr.sgl1.unkeyed.length;
-	}
-	return spdk_min(len, NVMF_OFI_IN_CAPSULE_DATA_SIZE);
+	return spdk_min(cmd->nvme_cmd.dptr.sgl1.unkeyed.length, NVMF_OFI_IN_CAPSULE_DATA_SIZE);
 }
 
 static int
@@ -1471,9 +1463,12 @@ nvmf_ofi_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 }
 
 /*
- * Drain the poll group's rx CQ and dispatch. Recv completions deliver a command
- * capsule (SQE [+ in-capsule data]); tx completions mean a response was sent and
- * its req can be recycled. All on the pg thread (FI_THREAD_DOMAIN).
+ * Drain the poll group's rx AND tx CQs and dispatch. Recv completions
+ * (cq_rx) deliver a command capsule (SQE [+ in-capsule data]); tx completions
+ * (cq_tx) mean a response was sent and its req can be recycled — which re-posts
+ * the held recv slot. BOTH must be drained: if cq_tx is never read, reqs (and
+ * their recv slots) are never recycled and the target starves after num_slots
+ * commands. All on the pg thread (FI_THREAD_DOMAIN).
  */
 static int
 nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
@@ -1484,6 +1479,36 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	struct fi_cq_err_entry err;
 	uint32_t reaped = 0;
 	ssize_t rc;
+
+	/* First drain tx completions: recycle reqs sent earlier this (or a prior)
+	 * poll, freeing recv slots before we try to receive new commands. */
+	while (reaped < 64) {
+		rc = fi_cq_read(opgroup->cq_tx, &entry, 1);
+		if (rc == -FI_EAGAIN) {
+			break;
+		}
+		if (rc == -FI_EAVAIL) {
+			memset(&err, 0, sizeof(err));
+			fi_cq_readerr(opgroup->cq_tx, &err, 0);
+			SPDK_WARNLOG("ofi target: cq_tx error err=%d(%s) prov=%d\n",
+				     err.err, fi_strerror(err.err), err.prov_errno);
+			break;
+		}
+		if (rc < 0) {
+			SPDK_ERRLOG("ofi target: cq_tx fi_cq_read: %zd\n", rc);
+			break;
+		}
+		reaped++;
+		{
+			/* TX completion: a response MSG was sent — recycle its req
+			 * (this also re-posts the recv slot the req was holding). */
+			struct spdk_nvmf_ofi_req *req = entry.op_context;
+			req->send_in_flight = false;
+			nvmf_ofi_req_release(req);
+		}
+	}
+
+	/* Then drain rx completions: receive + execute new commands. */
 	while (reaped < 64) {
 		rc = fi_cq_read(opgroup->cq_rx, &entry, 1);
 		if (rc == -FI_EAGAIN) {
@@ -1492,16 +1517,17 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 		if (rc == -FI_EAVAIL) {
 			memset(&err, 0, sizeof(err));
 			fi_cq_readerr(opgroup->cq_rx, &err, 0);
-			SPDK_WARNLOG("ofi target: CQ error err=%d prov=%d\n", err.err, err.prov_errno);
+			SPDK_WARNLOG("ofi target: cq_rx error err=%d(%s) prov=%d flags=0x%lx len=%zu olen=%zu\n",
+				     err.err, fi_strerror(err.err), err.prov_errno,
+				     (unsigned long)err.flags, err.len, err.olen);
 			break;
 		}
 		if (rc < 0) {
-			SPDK_ERRLOG("ofi target: fi_cq_read: %zd\n", rc);
+			SPDK_ERRLOG("ofi target: cq_rx fi_cq_read: %zd\n", rc);
 			break;
 		}
 		reaped++;
-
-		if (entry.flags & FI_RECV) {
+		{
 			struct spdk_nvmf_ofi_recv_slot *slot = entry.op_context;
 			struct spdk_nvmf_ofi_qpair *oqpair = slot->oqpair;
 			struct spdk_nvmf_ofi_req *req;
@@ -1553,11 +1579,6 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			}
 
 			spdk_nvmf_request_exec(&req->req);
-		} else {
-			/* TX completion: a response MSG was sent — recycle its req. */
-			struct spdk_nvmf_ofi_req *req = entry.op_context;
-			req->send_in_flight = false;
-			nvmf_ofi_req_release(req);
 		}
 	}
 
