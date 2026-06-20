@@ -492,10 +492,15 @@ nvme_ofi_ep_create(struct nvme_ofi_qpair *tqpair)
 		return rc;
 	}
 	/* Pin the EP's source to the NIC we reached the target on (the sideband
-	 * socket's local IP). fi_getinfo(node=NULL) otherwise lets the tcp provider
-	 * pick an arbitrary interface the target cannot route back to. */
+	 * socket's local IP). fi_getinfo(node=NULL) otherwise lets the tcp/sockets
+	 * provider pick an arbitrary interface the target cannot route back to.
+	 * This is a tcp/sockets-only workaround: verbs;ofi_rxm and cxi resolve the
+	 * EP address from the device themselves, and forcing a sockaddr source
+	 * breaks ofi_rxm's RC-connection setup (-FI_ECANCELED on the first send). */
 	if (tqpair->sb_sock != NULL &&
-	    tctrlr->info->addr_format == FI_SOCKADDR_IN) {
+	    tctrlr->info->addr_format == FI_SOCKADDR_IN &&
+	    (strncmp(tctrlr->provider, "tcp", 3) == 0 ||
+	     strncmp(tctrlr->provider, "sockets", 7) == 0)) {
 		char laddr[64] = {0}, raddr[64] = {0};
 		uint16_t lport, rport;
 		if (spdk_sock_getaddr(tqpair->sb_sock, laddr, sizeof(laddr), &lport,

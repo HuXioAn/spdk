@@ -738,10 +738,14 @@ nvmf_ofi_ep_setup_on_pg(void *ctx)
 		goto out;
 	}
 	/* Bind the EP's source address to the listener's NIC. fi_getinfo(node=NULL)
-	 * lets the tcp provider pick an arbitrary interface (e.g. 192.168.200.1),
-	 * which the peer cannot reach; pin it to the listen IP (port 0 = ephemeral). */
+	 * lets the tcp/sockets provider pick an arbitrary interface (e.g.
+	 * 192.168.200.1) the peer cannot reach; pin it to the listen IP
+	 * (port 0 = ephemeral). tcp/sockets-only: verbs;ofi_rxm and cxi resolve the
+	 * EP address from the device, and forcing a sockaddr source breaks ofi_rxm. */
 	if (conn->local_ip[0] != '\0' &&
-	    otransport->info->addr_format == FI_SOCKADDR_IN) {
+	    otransport->info->addr_format == FI_SOCKADDR_IN &&
+	    (strncmp(otransport->provider, "tcp", 3) == 0 ||
+	     strncmp(otransport->provider, "sockets", 7) == 0)) {
 		struct sockaddr_in src = {0};
 		src.sin_family = AF_INET;
 		src.sin_port = 0;
