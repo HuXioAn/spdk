@@ -275,6 +275,7 @@ struct spdk_nvmf_ofi_req {
 	 * advertised {rma_addr, rma_key} buffer, with data_buf as the local bounce. */
 	bool					use_rma;
 	bool					rma_is_read;	/* deferred-RMA direction (fi_read vs fi_write) */
+	bool					rma_with_cqe;	/* #46: C2H write folds the CQE as CQ immediate data */
 	uint64_t				rma_addr;	/* host buffer addr (vaddr or offset) */
 	uint64_t				rma_key;	/* host MR key */
 	uint32_t				cqe_len;	/* CQE capsule length for a deferred send */
@@ -1340,6 +1341,29 @@ nvmf_ofi_issue_rma(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_req 
 		return fi_read(oqpair->ep, oreq->data_buf, len, oreq->data_desc,
 			       oqpair->peer_fi_addr, oreq->rma_addr, oreq->rma_key, oreq);
 	}
+	if (oreq->rma_with_cqe) {
+		/* #46: fold the response CQE into the write as CQ immediate data (the
+		 * CID tag). The host completes on this single write completion — no
+		 * separate CQE MSG (saving a message, a send slot, a completion, and a
+		 * host recv slot on every READ). Success is implied; any error takes
+		 * the separate-CQE path in req_complete. RC TRANSMIT_COMPLETE (the
+		 * local completion below) ⇒ data delivered to host memory (p0b), and
+		 * the remote CQ data lands with it. */
+		struct spdk_nvme_cpl *rsp = &oreq->rsp_storage.nvme_cpl;
+		struct fi_msg_rma msg = {0};
+		struct iovec iov = { .iov_base = oreq->data_buf, .iov_len = len };
+		struct fi_rma_iov rma = { .addr = oreq->rma_addr, .len = len, .key = oreq->rma_key };
+
+		msg.msg_iov = &iov;
+		msg.desc = &oreq->data_desc;
+		msg.iov_count = 1;
+		msg.addr = oqpair->peer_fi_addr;
+		msg.rma_iov = &rma;
+		msg.rma_iov_count = 1;
+		msg.context = oreq;
+		msg.data = SPDK_NVMF_OFI_BUILD_TAG(rsp->cid, SPDK_NVMF_OFI_MSG_CQE);
+		return fi_writemsg(oqpair->ep, &msg, FI_REMOTE_CQ_DATA | FI_COMPLETION);
+	}
 	return fi_write(oqpair->ep, oreq->data_buf, len, oreq->data_desc,
 			oqpair->peer_fi_addr, oreq->rma_addr, oreq->rma_key, oreq);
 }
@@ -1359,6 +1383,7 @@ nvmf_ofi_post_rma(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_req *
 	ssize_t rc;
 
 	oreq->rma_is_read = is_read;
+	oreq->rma_with_cqe = false;
 	rc = nvmf_ofi_issue_rma(oqpair, oreq);
 	if (rc == -FI_EAGAIN) {
 		TAILQ_INSERT_TAIL(&oqpair->pending_rma, oreq, link);
@@ -1372,6 +1397,30 @@ nvmf_ofi_post_rma(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_req *
 	return 0;
 }
 
+/* #46: post a C2H write that folds the CQE as CQ immediate data — one operation
+ * delivers the read data AND the completion to the host, replacing the old
+ * fi_write + fi_sendmsg(CQE) pair. Defers to pending_rma on -FI_EAGAIN like
+ * post_rma; the deferred retry re-issues as a writemsg-with-CQE because
+ * issue_rma checks rma_with_cqe. */
+static int
+nvmf_ofi_post_rma_cqe(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_req *oreq)
+{
+	ssize_t rc;
+
+	oreq->rma_is_read = false;
+	oreq->rma_with_cqe = true;
+	rc = nvmf_ofi_issue_rma(oqpair, oreq);
+	if (rc == -FI_EAGAIN) {
+		TAILQ_INSERT_TAIL(&oqpair->pending_rma, oreq, link);
+		return 0;
+	}
+	if (rc != 0) {
+		SPDK_ERRLOG("ofi target: fi_writemsg(CQE): %s\n", fi_strerror(-(int)rc));
+		return (int)rc;
+	}
+	return 0;
+}
+
 /* Resume a deferred RMA after its completion: NVMe WRITE (fi_read done) execs the
  * command; NVMe READ (fi_write done) sends the CQE. */
 static void
@@ -1380,7 +1429,12 @@ nvmf_ofi_rma_done(struct spdk_nvmf_ofi_req *oreq)
 	if (oreq->rma_is_read) {
 		spdk_nvmf_request_exec(&oreq->req);
 	} else {
-		nvmf_ofi_send_cqe(oreq, sizeof(struct spdk_nvme_cpl));
+		/* C2H write done. #46: the CQE was folded into the write as CQ
+		 * immediate data, so it is already delivered to the host — no separate
+		 * CQE to send. (This is the only C2H-write path now; the separate-CQE
+		 * fallback posts a fi_sendmsg, not an RMA write, and completes via the
+		 * FI_SEND path.) Recycle the req. */
+		nvmf_ofi_req_release(oreq);
 	}
 }
 
@@ -1652,10 +1706,24 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			break;
 		}
 		if (rc == -FI_EAVAIL) {
+			struct spdk_nvmf_ofi_req *oreq;
 			memset(&err, 0, sizeof(err));
 			fi_cq_readerr(opgroup->cq_tx, &err, 0);
-			SPDK_WARNLOG("ofi target: cq_tx error err=%d(%s) prov=%d\n",
-				     err.err, fi_strerror(err.err), err.prov_errno);
+			SPDK_WARNLOG("ofi target: cq_tx error err=%d(%s) prov=%d flags=0x%lx\n",
+				     err.err, fi_strerror(err.err), err.prov_errno,
+				     (unsigned long)err.flags);
+			/* A TX completion errored (a V2 fi_read/fi_write, or a response send).
+			 * The fabric path for this qpair is now unreliable — and the owning
+			 * req was leaked while the host hung on a CQE that will never arrive
+			 * (the old code only logged + broke). Disconnect the qpair, matching
+			 * tcp.c's response to a CQ error: the core aborts in-flight requests
+			 * with transport errors so hosts complete instead of hanging.
+			 * err.op_context is the failed op's context, which is always the
+			 * owning req here (issue_rma / issue_send both pass oreq). */
+			oreq = err.op_context;
+			if (oreq != NULL) {
+				spdk_nvmf_qpair_disconnect(&oreq->oqpair->qpair);
+			}
 			break;
 		}
 		if (rc < 0) {
@@ -1696,11 +1764,20 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			break;
 		}
 		if (rc == -FI_EAVAIL) {
+			struct spdk_nvmf_ofi_recv_slot *slot;
 			memset(&err, 0, sizeof(err));
 			fi_cq_readerr(opgroup->cq_rx, &err, 0);
 			SPDK_WARNLOG("ofi target: cq_rx error err=%d(%s) prov=%d flags=0x%lx len=%zu olen=%zu\n",
 				     err.err, fi_strerror(err.err), err.prov_errno,
 				     (unsigned long)err.flags, err.len, err.olen);
+			/* A recv completion errored — the connection is broken. Disconnect the
+			 * qpair so in-flight requests are aborted, not stranded. err.op_context
+			 * is the recv buffer's slot (the success path also reads it as the
+			 * slot at entry.op_context). */
+			slot = err.op_context;
+			if (slot != NULL) {
+				spdk_nvmf_qpair_disconnect(&slot->oqpair->qpair);
+			}
 			break;
 		}
 		if (rc < 0) {
@@ -1914,11 +1991,13 @@ nvmf_ofi_req_complete(struct spdk_nvmf_request *req)
 		if (spdk_nvme_cpl_is_success(rsp) &&
 		    req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST && req->length > 0 &&
 		    req->iovcnt > 0) {
-			/* Push the read result to the host, send the CQE on completion. */
-			if (nvmf_ofi_post_rma(oreq->oqpair, oreq, false) == 0) {
+			/* Push the read result AND deliver the CQE in one operation (#46): a
+			 * fi_writemsg carrying the CID as CQ immediate data. The host
+			 * completes on the write; no separate CQE MSG. On failure, fall
+			 * through to the separate-CQE path below. */
+			if (nvmf_ofi_post_rma_cqe(oreq->oqpair, oreq) == 0) {
 				return;
 			}
-			/* fi_write failed: fall through and report the CQE as-is. */
 		}
 		nvmf_ofi_send_cqe(oreq, send_len);
 		return;

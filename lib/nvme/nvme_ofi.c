@@ -555,8 +555,12 @@ nvme_ofi_ep_create(struct nvme_ofi_qpair *tqpair)
 	}
 	rc = fi_ep_bind(tqpair->ep, &tctrlr->av->fid, 0);
 	if (rc != 0) { goto err; }
-	/* The host uses a single CQ for both tx and rx (a host qpair has its own
-	 * completion stream; binding both flags to one CQ is fine for manual poll). */
+	/* The host uses a single CQ for tx and rx (a host qpair has its own completion
+	 * stream; binding both flags to one CQ is fine for manual poll). A target
+	 * fi_write carrying CQ immediate data (#46: the folded READ completion) is an
+	 * incoming-data event, so it lands on this same RECV CQ with entry.flags =
+	 * FI_REMOTE_WRITE — distinguished from FI_RECV MSGs in the drain loop. (Note:
+	 * FI_REMOTE_WRITE is NOT a valid fi_ep_bind flag; it is a CQ-entry op flag.) */
 	rc = fi_ep_bind(tqpair->ep, &tqpair->cq->fid, FI_TRANSMIT | FI_RECV);
 	if (rc != 0) { goto err; }
 
@@ -994,6 +998,19 @@ nvme_ofi_drain_cq(struct nvme_ofi_qpair *tqpair, uint32_t max_completions)
 				 * but a permanent leak would starve the recv pool over time. */
 				SPDK_WARNLOG("ofi host: recv re-post failed (slot leaked)\n");
 			}
+		} else if (entry.flags & FI_REMOTE_WRITE) {
+			/* #46: folded READ completion — the target's fi_write carried the CID
+			 * as CQ immediate data and the read data landed in our payload MR.
+			 * Synthesize a success CQE (fabrics ignores sqhd/phase; only cid +
+			 * success status matter) and complete. No recv buffer was consumed,
+			 * so nothing to re-post. */
+			uint16_t cid = NVME_OFI_TAG_CID(entry.data);
+			struct spdk_nvme_cpl cpl = {};
+
+			cpl.cid = cid;
+			cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+			cpl.status.sc = SPDK_NVME_SC_SUCCESS;
+			nvme_ofi_complete_request(tqpair, cid, &cpl, NULL, 0);
 		} else {
 			struct nvme_ofi_send_slot *slot = entry.op_context;
 			slot->busy = false;
