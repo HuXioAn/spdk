@@ -35,6 +35,7 @@
 #include "spdk/string.h"
 #include "spdk/util.h"
 #include "spdk/log.h"
+#include "spdk/dma.h"
 
 #include "nvme_internal.h"
 
@@ -54,6 +55,16 @@
 /* OFI_RMA=0 forces the V1 in-capsule data path; unset/non-zero = V2 target RMA. */
 #define NVME_OFI_RMA_ENV		"OFI_RMA"
 #define NVME_OFI_FI_VERSION		FI_VERSION(1, 22)
+
+/* Spin cap for fi_injectdata/fi_sendmsg on -FI_EAGAIN, draining our own CQ
+ * between attempts. This CANNOT be small: the first send to a freshly-enabled EP
+ * (the Fabrics CONNECT) returns -FI_EAGAIN while ofi_rxm establishes the RC
+ * connection, and the core's async-connect submits exactly once — returning
+ * -EAGAIN there (or in the core's resubmit path) puts the controller in an error
+ * state. So the spin must run until success; 100000 is a safety cap that is
+ * rarely approached (the CQ drain frees send slots, so it self-resolves in a
+ * few iterations). Tried bounding to 128 — connect failed deterministically. */
+#define NVME_OFI_SEND_SPIN_MAX	100000
 
 /* V1 in-capsule data ceiling. An IO whose data exceeds this is rejected (V2
  * RMA handles large IO). Sized to hold a Fabrics CONNECT data struct and an
@@ -182,6 +193,7 @@ struct nvme_ofi_recv_slot {
 	void			*desc;		/* MR desc (FI_MR_LOCAL) or NULL */
 	struct fid_mr		*mr;		/* MR handle when mr_local */
 	bool			posted;
+	TAILQ_ENTRY(nvme_ofi_recv_slot) link;	/* on tqpair->pending_recvs when re-post deferred */
 };
 
 /* A send slot. Holds the SQE [+ in-capsule data] being transmitted; the CID
@@ -247,6 +259,7 @@ struct nvme_ofi_qpair {
 	struct nvme_ofi_recv_slot	*recv_slots;
 	struct nvme_ofi_send_slot	*send_slots;
 	uint32_t			num_slots;	/* == sq depth */
+	TAILQ_HEAD(, nvme_ofi_recv_slot) pending_recvs; /* recv re-posts deferred on -FI_EAGAIN */
 
 	/* outstanding requests indexed by CID (matches the SQ). The core owns the
 	 * nvme_request objects; we keep a pointer here to complete on CQE. */
@@ -767,8 +780,13 @@ static int
 nvme_ofi_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
 				  struct spdk_memory_domain **domains, int array_size)
 {
-	/* OFI does not export a memory domain. */
-	return 0;
+	/* Advertise the system memory domain (normal memory we fi_mr_reg by vaddr).
+	 * Returning 0 makes the bdev layer think the transport accepts no memory
+	 * domain, disabling zero-copy matching — mirrors nvme_tcp.c. */
+	if (domains && array_size > 0) {
+		domains[0] = spdk_memory_domain_get_system_domain();
+	}
+	return 1;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -853,6 +871,7 @@ nvme_ofi_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 	    tqpair->req_table == NULL) {
 		goto err;
 	}
+	TAILQ_INIT(&tqpair->pending_recvs);
 	for (i = 0; i < qsize; i++) {
 		tqpair->recv_slots[i].tqpair = tqpair;
 		tqpair->recv_slots[i].buf = spdk_zmalloc(NVME_OFI_RECV_BUF_SIZE, 0, NULL,
@@ -864,16 +883,22 @@ nvme_ofi_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 			goto err;
 		}
 		if (tqpair->mr_local) {
-			fi_mr_reg(tqpair->domain, tqpair->recv_slots[i].buf,
-				  NVME_OFI_RECV_BUF_SIZE, FI_RECV, 0, 0, 0,
-				  &tqpair->recv_slots[i].mr, NULL);
-			fi_mr_reg(tqpair->domain, tqpair->send_slots[i].buf,
-				  NVME_OFI_SEND_BUF_SIZE, FI_SEND, 0, 0, 0,
-				  &tqpair->send_slots[i].mr, NULL);
-			tqpair->recv_slots[i].desc = tqpair->recv_slots[i].mr ?
-						    fi_mr_desc(tqpair->recv_slots[i].mr) : NULL;
-			tqpair->send_slots[i].desc = tqpair->send_slots[i].mr ?
-						    fi_mr_desc(tqpair->send_slots[i].mr) : NULL;
+			rc = fi_mr_reg(tqpair->domain, tqpair->recv_slots[i].buf,
+				       NVME_OFI_RECV_BUF_SIZE, FI_RECV, 0, 0, 0,
+				       &tqpair->recv_slots[i].mr, NULL);
+			if (rc != 0) {
+				SPDK_ERRLOG("ofi host: fi_mr_reg(recv): %s\n", fi_strerror(-rc));
+				goto err;
+			}
+			rc = fi_mr_reg(tqpair->domain, tqpair->send_slots[i].buf,
+				       NVME_OFI_SEND_BUF_SIZE, FI_SEND, 0, 0, 0,
+				       &tqpair->send_slots[i].mr, NULL);
+			if (rc != 0) {
+				SPDK_ERRLOG("ofi host: fi_mr_reg(send): %s\n", fi_strerror(-rc));
+				goto err;
+			}
+			tqpair->recv_slots[i].desc = fi_mr_desc(tqpair->recv_slots[i].mr);
+			tqpair->send_slots[i].desc = fi_mr_desc(tqpair->send_slots[i].mr);
 		}
 	}
 
@@ -940,6 +965,21 @@ nvme_ofi_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_q
 /* connect: sideband handshake + EP bring-up, driven from process_completions */
 /* -------------------------------------------------------------------------- */
 
+/* Retry recv slots whose re-post hit -FI_EAGAIN (queued in drain_cq's recv
+ * branch). Called at the top of drain_cq so re-posted buffers can receive. */
+static void
+nvme_ofi_drain_pending_recv(struct nvme_ofi_qpair *tqpair)
+{
+	struct nvme_ofi_recv_slot *slot;
+
+	while ((slot = TAILQ_FIRST(&tqpair->pending_recvs)) != NULL) {
+		if (nvme_ofi_post_recv(tqpair, slot) != 0) {
+			break;	/* still -FI_EAGAIN; retry next drain_cq */
+		}
+		TAILQ_REMOVE(&tqpair->pending_recvs, slot, link);
+	}
+}
+
 /*
  * Drain the per-qpair CQ: complete recv'd CQEs (match by cid tag) and recycle
  * send slots on tx completions. Shared by the connect poll (reaps the Fabrics
@@ -956,6 +996,7 @@ nvme_ofi_drain_cq(struct nvme_ofi_qpair *tqpair, uint32_t max_completions)
 	if (!tqpair->ep_enabled) {
 		return 0;
 	}
+	nvme_ofi_drain_pending_recv(tqpair);
 	if (max_completions == 0) {
 		max_completions = tqpair->num_slots;
 	}
@@ -997,10 +1038,10 @@ nvme_ofi_drain_cq(struct nvme_ofi_qpair *tqpair, uint32_t max_completions)
 			}
 			slot->posted = false;
 			if (nvme_ofi_post_recv(tqpair, slot) != 0) {
-				/* Re-post failed (provider -FI_EAGAIN). The recv buffer stays
-				 * unposted; with the tcp provider this is transient and rare,
-				 * but a permanent leak would starve the recv pool over time. */
-				SPDK_WARNLOG("ofi host: recv re-post failed (slot leaked)\n");
+				/* Provider recv resources exhausted (-FI_EAGAIN). Queue instead
+				 * of dropping — a dropped slot permanently shrinks the recv pool
+				 * and starves the qpair. Retried at the top of the next drain_cq. */
+				TAILQ_INSERT_TAIL(&tqpair->pending_recvs, slot, link);
 			}
 		} else if (entry.flags & FI_REMOTE_WRITE) {
 			/* #46: folded READ completion — the target's fi_write carried the CID
@@ -1496,7 +1537,7 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 				break;
 			}
 			nvme_ofi_drain_cq(tqpair, tqpair->num_slots);
-		} while (++spins < 100000);
+		} while (++spins < NVME_OFI_SEND_SPIN_MAX);
 		if (rc == -FI_EAGAIN) {
 			return -EAGAIN;
 		}
@@ -1526,7 +1567,7 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 				break;
 			}
 			nvme_ofi_drain_cq(tqpair, tqpair->num_slots);
-		} while (++spins < 100000);
+		} while (++spins < NVME_OFI_SEND_SPIN_MAX);
 	}
 	if (rc == -FI_EAGAIN) {
 		return -EAGAIN;

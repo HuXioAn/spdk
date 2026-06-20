@@ -71,6 +71,16 @@
 /* Accept poller rate (us) for the sideband listener sock group. */
 #define NVMF_OFI_ACCEPT_POLL_RATE_US	SPDK_NVMF_DEFAULT_ACCEPT_POLL_RATE_US
 
+/* Max completions reaped from each CQ per poll_group_poll call. tx and rx drains
+ * get SEPARATE budgets (a shared counter starved cq_rx whenever cq_tx filled it). */
+#define NVMF_OFI_CQ_DRAIN_BATCH		64
+
+/* Bounded retry count for re-posting a recv buffer on -FI_EAGAIN. Was unbounded
+ * (do/while) — a persistent EAGAIN could wedge the reactor thread inside
+ * poll_group_poll. On exhaustion the slot is queued to the qpair's pending_recvs
+ * and retried on the next poll (after cq_tx drains and frees provider resources). */
+#define NVMF_OFI_POST_RECV_RETRIES	256
+
 /* Per-connection sideband recv/send scratch. The largest handshake frame is
  * hdr + ADDR_EXCHANGE payload; round up generously. */
 #define NVMF_OFI_SB_BUF_SIZE		(sizeof(struct ofi_sb_hdr) + OFI_SB_MAX_ADDR_EXCHANGE_PAYLOAD)
@@ -244,6 +254,7 @@ struct spdk_nvmf_ofi_qpair {
 	 * (a req here is out of free_reqs, and is on at most one list at a time). */
 	TAILQ_HEAD(, spdk_nvmf_ofi_req)	pending_rma;
 	TAILQ_HEAD(, spdk_nvmf_ofi_req)	pending_send;
+	TAILQ_HEAD(, spdk_nvmf_ofi_recv_slot) pending_recvs; /* recv re-posts deferred on -FI_EAGAIN */
 	uint32_t				num_slots;	/* == queue depth */
 	bool					pools_ready;
 
@@ -268,6 +279,7 @@ struct spdk_nvmf_ofi_recv_slot {
 	void				*desc;		/* MR desc (FI_MR_LOCAL) or NULL */
 	struct fid_mr			*mr;		/* MR handle when mr_local */
 	bool				posted;
+	TAILQ_ENTRY(spdk_nvmf_ofi_recv_slot) link;	/* on oqpair->pending_recvs when re-post deferred */
 };
 
 /*
@@ -1365,11 +1377,16 @@ static int
 nvmf_ofi_post_recv(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_recv_slot *slot)
 {
 	ssize_t rc;
+	int tries = 0;
 
+	/* Bounded retry: under FI_PROGRESS_MANUAL only draining the CQ frees provider
+	 * recv resources, and we may be the poll loop — an unbounded spin on a
+	 * persistent -FI_EAGAIN would wedge this reactor thread. On exhaustion the
+	 * caller queues the slot to pending_recvs for a later retry. */
 	do {
 		rc = fi_recv(oqpair->ep, slot->buf, NVMF_OFI_RECV_BUF_SIZE, slot->desc,
 			     oqpair->peer_fi_addr, slot);
-	} while (rc == -FI_EAGAIN);
+	} while (rc == -FI_EAGAIN && ++tries < NVMF_OFI_POST_RECV_RETRIES);
 
 	if (rc != 0) {
 		SPDK_ERRLOG("ofi target: fi_recv: %s\n", fi_strerror(-(int)rc));
@@ -1381,6 +1398,7 @@ nvmf_ofi_post_recv(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_recv
 
 static void nvmf_ofi_send_cqe(struct spdk_nvmf_ofi_req *oreq, uint32_t send_len);
 static void nvmf_ofi_req_release(struct spdk_nvmf_ofi_req *req);
+static void nvmf_ofi_req_complete(struct spdk_nvmf_request *req);
 
 /* Raw RMA issue: fi_read (NVMe WRITE: pull host data into data_buf) or fi_write
  * (NVMe READ: push data_buf to host). op_context is the req so the cq_tx
@@ -1567,6 +1585,27 @@ nvmf_ofi_drain_pending_send(struct spdk_nvmf_ofi_poll_group *opgroup)
 	}
 }
 
+/* Retry recv slots whose re-post hit -FI_EAGAIN (queued in nvmf_ofi_req_release).
+ * Called at the top of poll_group_poll, before the cq_tx drain, so re-posted
+ * buffers are available to receive new commands. Stops at the first slot still
+ * failing (resources still full) — it retries next poll. */
+static void
+nvmf_ofi_drain_pending_recv(struct spdk_nvmf_ofi_poll_group *opgroup)
+{
+	struct spdk_nvmf_ofi_qpair *oqpair;
+
+	TAILQ_FOREACH(oqpair, &opgroup->qpairs, link) {
+		struct spdk_nvmf_ofi_recv_slot *slot;
+
+		while ((slot = TAILQ_FIRST(&oqpair->pending_recvs)) != NULL) {
+			if (nvmf_ofi_post_recv(oqpair, slot) != 0) {
+				break;
+			}
+			TAILQ_REMOVE(&oqpair->pending_recvs, slot, link);
+		}
+	}
+}
+
 static struct spdk_nvmf_ofi_req *
 nvmf_ofi_req_get(struct spdk_nvmf_ofi_qpair *oqpair)
 {
@@ -1593,7 +1632,13 @@ nvmf_ofi_req_release(struct spdk_nvmf_ofi_req *req)
 
 	if (req->recv_slot != NULL) {
 		req->recv_slot->posted = false;
-		nvmf_ofi_post_recv(oqpair, req->recv_slot);
+		if (nvmf_ofi_post_recv(oqpair, req->recv_slot) != 0) {
+			/* Provider recv resources exhausted (-FI_EAGAIN after bounded retry).
+			 * Queue the slot instead of dropping it — a dropped recv slot
+			 * permanently shrinks the pool and starves the qpair. Retried at the
+			 * top of the next poll_group_poll (draining cq_tx frees resources). */
+			TAILQ_INSERT_TAIL(&oqpair->pending_recvs, req->recv_slot, link);
+		}
 		req->recv_slot = NULL;
 	}
 	TAILQ_INSERT_TAIL(&oqpair->free_reqs, req, link);
@@ -1657,6 +1702,7 @@ nvmf_ofi_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	TAILQ_INIT(&oqpair->free_reqs);
 	TAILQ_INIT(&oqpair->pending_rma);
 	TAILQ_INIT(&oqpair->pending_send);
+	TAILQ_INIT(&oqpair->pending_recvs);
 
 	oqpair->recv_slots = calloc(qd, sizeof(*oqpair->recv_slots));
 	oqpair->reqs = calloc(qd, sizeof(*oqpair->reqs));
@@ -1685,15 +1731,27 @@ nvmf_ofi_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 			goto err;
 		}
 		if (oqpair->mr_local) {
-			fi_mr_reg(opgroup->domain, rs->buf, NVMF_OFI_RECV_BUF_SIZE,
-				  FI_RECV, 0, 0, 0, &rs->mr, NULL);
-			fi_mr_reg(opgroup->domain, rq->send_buf, NVMF_OFI_SEND_BUF_SIZE,
-				  FI_SEND, 0, 0, 0, &rq->send_mr, NULL);
-			fi_mr_reg(opgroup->domain, rq->data_buf, NVMF_OFI_RMA_DATA_SIZE,
-				  FI_READ | FI_WRITE, 0, 0, 0, &rq->data_mr, NULL);
-			rs->desc = rs->mr ? fi_mr_desc(rs->mr) : NULL;
-			rq->send_desc = rq->send_mr ? fi_mr_desc(rq->send_mr) : NULL;
-			rq->data_desc = rq->data_mr ? fi_mr_desc(rq->data_mr) : NULL;
+			rc = fi_mr_reg(opgroup->domain, rs->buf, NVMF_OFI_RECV_BUF_SIZE,
+				       FI_RECV, 0, 0, 0, &rs->mr, NULL);
+			if (rc != 0) {
+				SPDK_ERRLOG("ofi target: fi_mr_reg(recv): %s\n", fi_strerror(-rc));
+				goto err;
+			}
+			rc = fi_mr_reg(opgroup->domain, rq->send_buf, NVMF_OFI_SEND_BUF_SIZE,
+				       FI_SEND, 0, 0, 0, &rq->send_mr, NULL);
+			if (rc != 0) {
+				SPDK_ERRLOG("ofi target: fi_mr_reg(send): %s\n", fi_strerror(-rc));
+				goto err;
+			}
+			rc = fi_mr_reg(opgroup->domain, rq->data_buf, NVMF_OFI_RMA_DATA_SIZE,
+				       FI_READ | FI_WRITE, 0, 0, 0, &rq->data_mr, NULL);
+			if (rc != 0) {
+				SPDK_ERRLOG("ofi target: fi_mr_reg(data): %s\n", fi_strerror(-rc));
+				goto err;
+			}
+			rs->desc = fi_mr_desc(rs->mr);
+			rq->send_desc = fi_mr_desc(rq->send_mr);
+			rq->data_desc = fi_mr_desc(rq->data_mr);
 		}
 		TAILQ_INSERT_TAIL(&oqpair->free_reqs, rq, link);
 	}
@@ -1749,12 +1807,19 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 		SPDK_CONTAINEROF(group, struct spdk_nvmf_ofi_poll_group, group);
 	struct fi_cq_data_entry entry;
 	struct fi_cq_err_entry err;
-	uint32_t reaped = 0;
+	uint32_t reaped = 0, batch;
 	ssize_t rc;
 
+	/* Re-post recv slots whose re-post was deferred on -FI_EAGAIN, before
+	 * draining — so they can receive the commands we are about to pull. */
+	nvmf_ofi_drain_pending_recv(opgroup);
+
 	/* First drain tx completions: recycle reqs sent earlier this (or a prior)
-	 * poll, freeing recv slots before we try to receive new commands. */
-	while (reaped < 64) {
+	 * poll, freeing recv slots before we try to receive new commands. tx and rx
+	 * get SEPARATE budgets: a shared counter starved cq_rx whenever cq_tx filled
+	 * the batch, leaving commands unprocessed that poll. */
+	batch = 0;
+	while (batch < NVMF_OFI_CQ_DRAIN_BATCH) {
 		rc = fi_cq_read(opgroup->cq_tx, &entry, 1);
 		if (rc == -FI_EAGAIN) {
 			break;
@@ -1789,6 +1854,7 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			break;
 		}
 		reaped++;
+		batch++;
 		{
 			/* TX completion. Three kinds land on cq_tx, distinguished by the
 			 * op flags (the op_context is always the req):
@@ -1815,8 +1881,10 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	nvmf_ofi_drain_pending_rma(opgroup);
 	nvmf_ofi_drain_pending_send(opgroup);
 
-	/* Then drain rx completions: receive + execute new commands. */
-	while (reaped < 64) {
+	/* Then drain rx completions: receive + execute new commands. (Own budget —
+	 * independent of how many tx completions were reaped above.) */
+	batch = 0;
+	while (batch < NVMF_OFI_CQ_DRAIN_BATCH) {
 		rc = fi_cq_read(opgroup->cq_rx, &entry, 1);
 		if (rc == -FI_EAGAIN) {
 			break;
@@ -1847,6 +1915,7 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			break;
 		}
 		reaped++;
+		batch++;
 		{
 			struct spdk_nvmf_ofi_recv_slot *slot = entry.op_context;
 			struct spdk_nvmf_ofi_qpair *oqpair = slot->oqpair;
@@ -1884,9 +1953,23 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 				uint32_t rlen = sgl->keyed.length;
 
 				if (rlen > NVMF_OFI_RMA_DATA_SIZE) {
-					SPDK_WARNLOG("ofi target: RMA len %u > %d ceiling, clamping\n",
-						     rlen, NVMF_OFI_RMA_DATA_SIZE);
-					rlen = NVMF_OFI_RMA_DATA_SIZE;
+					/* Reject, never clamp: clamping moved only 128 KiB but still
+					 * completed the command as success — silent corruption for any
+					 * initiator that advertises a larger keyed SGL (our own host
+					 * pre-rejects >128K, but arbitrary initiators won't). Complete
+					 * with INVALID_FIELD via the normal path (length 0 ⇒ no data
+					 * appended; the error status skips the C2H-data branch). */
+					struct spdk_nvme_cpl *rsp = &req->rsp_storage.nvme_cpl;
+					SPDK_ERRLOG("ofi target: keyed SGL len %u > %d ceiling, rejecting (cid=%u)\n",
+						    rlen, NVMF_OFI_RMA_DATA_SIZE, sqe->cid);
+					memset(rsp, 0, sizeof(*rsp));
+					rsp->cid = sqe->cid;
+					rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+					rsp->status.sc = SPDK_NVME_SC_INVALID_FIELD;
+					req->req.length = 0;
+					req->req.iovcnt = 0;
+					nvmf_ofi_req_complete(&req->req);
+					continue;
 				}
 				req->use_rma = true;
 				req->rma_addr = sgl->address;

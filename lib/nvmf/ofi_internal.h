@@ -98,10 +98,14 @@ struct ofi_sb_addr {
 	uint32_t	ep_addr_len_le;
 	uint32_t	mtu_le;
 	uint32_t	flags_le;			/* bit0 = RMA-capable (V2) */
-	uint32_t	data_buf_count_le;		/* V2 only */
-	uint64_t	data_buf_addr_le;		/* V2 only */
-	uint64_t	data_buf_key_le;		/* V2 only */
-	/* followed by uint8_t ep_addr[ep_addr_len] */
+	uint32_t	data_buf_count_le;		/* RESERVED (kept for wire-layout stability) */
+	uint64_t	data_buf_addr_le;		/* RESERVED (kept for wire-layout stability) */
+	uint64_t	data_buf_key_le;		/* RESERVED (kept for wire-layout stability) */
+	/* followed by uint8_t ep_addr[ep_addr_len].
+	 * NOTE: data_buf_{count,addr,key} are vestigial from an early V2 design and
+	 * are never set or read today — V2 carries the host's RMA {addr,key} in the
+	 * NVMe command's keyed SGL (dptr), not in ADDR_EXCHANGE. They remain in the
+	 * struct only to keep the 64-byte fixed header / wire format stable. */
 } __attribute__((packed));
 
 struct ofi_sb_teardown {
