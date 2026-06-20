@@ -163,6 +163,20 @@ struct spdk_nvmf_ofi_sb_conn {
 	uint8_t				local_ep_addr[NVMF_OFI_MAX_EP_ADDR_LEN];
 	size_t				local_ep_addr_len;
 
+	/* Lifetime: a conn whose handshake reached DONE keeps a back-reference from
+	 * its qpair (oqpair->sb_conn) so that when the host drops the sideband TCP
+	 * (spdk_sock_recv == 0 — a fast, reliable host-gone signal), the acceptor
+	 * thread can disconnect the qpair that was handed to nvmf. Without this,
+	 * idle qpairs (notably the admin qpair, which ofi_rxm does NOT surface as a
+	 * CQ error when the peer vanishes) would leak their EP/QP/AV entry forever,
+	 * and a lingering QP intermittently wedges the next rapid reconnect's verbs
+	 * connection establishment (host Fabrics CONNECT times out → -ECANCELED).
+	 *
+	 * refcnt is manipulated ONLY on the acceptor thread (sideband close, and the
+	 * qpair-free message qpair_fini sends here): 1 while only the sideband owns
+	 * it, 2 once a DONE qpair also holds a back-ref. The last release frees conn. */
+	uint32_t			refcnt;
+
 	TAILQ_ENTRY(spdk_nvmf_ofi_sb_conn)	link;
 };
 
@@ -236,6 +250,12 @@ struct spdk_nvmf_ofi_qpair {
 	struct spdk_nvme_transport_id		peer_trid;
 	struct spdk_nvme_transport_id		local_trid;
 	struct spdk_nvme_transport_id		listen_trid;
+
+	/* Back-ref to the sideband conn that brought this qpair up (NULL until the
+	 * handshake reaches DONE). Set on the acceptor thread; cleared + the qpair
+	 * struct freed there (via the message qpair_fini sends), so conn->oqpair is
+	 * never read dangling. See spdk_nvmf_ofi_sb_conn.refcnt. */
+	struct spdk_nvmf_ofi_sb_conn		*sb_conn;
 
 	TAILQ_ENTRY(spdk_nvmf_ofi_qpair)	link;
 };
@@ -622,11 +642,21 @@ nvmf_ofi_stop_listen(struct spdk_nvmf_transport *transport,
 /* Sideband accept + handshake state machine (design §5.3, passive role)      */
 /* -------------------------------------------------------------------------- */
 
-/* Close a sideband connection: remove from the accept group, close the sock,
- * unlink, free. Safe to call from the data callback (after which the caller
- * must not touch conn). */
+/* Drop one reference to a sideband conn; free it when the last holder
+ * releases. Manipulated ONLY on the acceptor thread (the sideband data
+ * callback and the qpair-free message qpair_fini sends here). */
 static void
-nvmf_ofi_sb_conn_close(struct spdk_nvmf_ofi_sb_conn *conn)
+nvmf_ofi_sb_conn_release(struct spdk_nvmf_ofi_sb_conn *conn)
+{
+	if (--conn->refcnt == 0) {
+		free(conn);
+	}
+}
+
+/* Remove a conn's sock from the accept group and unlink it from the transport's
+ * sb_conns list. Does NOT free — pair with nvmf_ofi_sb_conn_release. */
+static void
+nvmf_ofi_sb_conn_detach(struct spdk_nvmf_ofi_sb_conn *conn)
 {
 	struct spdk_nvmf_ofi_transport *otransport = conn->transport;
 
@@ -635,7 +665,23 @@ nvmf_ofi_sb_conn_close(struct spdk_nvmf_ofi_sb_conn *conn)
 		spdk_sock_close(&conn->sock);
 	}
 	TAILQ_REMOVE(&otransport->sb_conns, conn, link);
-	free(conn);
+}
+
+/* The host closed (recv==0) or errored the sideband TCP. This is the fast,
+ * reliable host-gone signal ofi_rxm does not give us for an idle connection:
+ * disconnect the qpair this conn handed to nvmf so its EP/QP and AV entry come
+ * down promptly (instead of leaking until a keepalive timeout, which also left
+ * a lingering QP that intermittently wedged the next rapid reconnect). Then
+ * release the conn. Safe to call from the data callback. */
+static void
+nvmf_ofi_sb_conn_close(struct spdk_nvmf_ofi_sb_conn *conn)
+{
+	if (conn->oqpair != NULL && conn->state == OFI_SB_DONE) {
+		spdk_nvmf_qpair_disconnect(&conn->oqpair->qpair);
+		conn->oqpair = NULL;	/* qpair_fini's message will drop the back-ref */
+	}
+	nvmf_ofi_sb_conn_detach(conn);
+	nvmf_ofi_sb_conn_release(conn);
 }
 
 /* Send a single handshake frame (hdr + optional payload) on the sideband sock.
@@ -1013,7 +1059,13 @@ nvmf_ofi_sb_handle_frame(struct spdk_nvmf_ofi_sb_conn *conn,
 		oqpair->listen_trid = conn->listen_trid;
 		oqpair->local_trid = conn->listen_trid;
 
-		conn->oqpair = NULL;	/* ownership passes to nvmf / the poll group */
+		/* Hand the qpair to nvmf, but keep the sideband↔qpair link alive: the
+		 * conn holds oqpair, and oqpair holds a back-ref to conn (refcount 2 —
+		 * sideband + qpair). When the host drops the sideband TCP, the data
+		 * callback disconnects this qpair; when the qpair is freed, qpair_fini
+		 * clears the link and releases conn. Whichever is last frees the conn. */
+		oqpair->sb_conn = conn;
+		conn->refcnt = 2;
 		spdk_nvmf_tgt_new_qpair(otransport->transport.tgt, &oqpair->qpair);
 		return 0;
 	}
@@ -1126,6 +1178,7 @@ nvmf_ofi_accept_cb(void *ctx, struct spdk_sock_group *group, struct spdk_sock *l
 		conn->transport = otransport;
 		conn->state = OFI_SB_WAIT_HELLO;
 		conn->listen_trid = listener->trid;
+		conn->refcnt = 1;	/* the sideband owns it; +1 at DONE for the qpair */
 
 		if (spdk_sock_getaddr(sock, saddr, sizeof(saddr), &sport,
 				      caddr, sizeof(caddr), &cport) == 0) {
@@ -1655,8 +1708,9 @@ nvmf_ofi_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	oqpair->pools_ready = true;
 
 	TAILQ_INSERT_TAIL(&opgroup->qpairs, oqpair, link);
-	SPDK_INFOLOG(nvmf_ofi, "qpair added to pg thread %s (ep=%p peer_fi_addr=0x%lx qd=%u)\n",
-		     spdk_thread_get_name(opgroup->thread), (void *)oqpair->ep,
+	SPDK_INFOLOG(nvmf_ofi, "qpair added to pg thread %s (ep=%p qp=%p peer=%s:%s peer_fi_addr=0x%lx qd=%u)\n",
+		     spdk_thread_get_name(opgroup->thread), (void *)oqpair->ep, (void *)&oqpair->qpair,
+		     oqpair->peer_trid.traddr, oqpair->peer_trid.trsvcid,
 		     (unsigned long)oqpair->peer_fi_addr, qd);
 	return 0;
 
@@ -1722,6 +1776,10 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			 * owning req here (issue_rma / issue_send both pass oreq). */
 			oreq = err.op_context;
 			if (oreq != NULL) {
+				SPDK_NOTICELOG("ofi target: cq_tx-err disconnect qpair=%p peer=%s:%s\n",
+					       (void *)&oreq->oqpair->qpair,
+					       oreq->oqpair->peer_trid.traddr,
+					       oreq->oqpair->peer_trid.trsvcid);
 				spdk_nvmf_qpair_disconnect(&oreq->oqpair->qpair);
 			}
 			break;
@@ -1776,6 +1834,10 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			 * slot at entry.op_context). */
 			slot = err.op_context;
 			if (slot != NULL) {
+				SPDK_NOTICELOG("ofi target: cq_rx-err disconnect qpair=%p peer=%s:%s\n",
+					       (void *)&slot->oqpair->qpair,
+					       slot->oqpair->peer_trid.traddr,
+					       slot->oqpair->peer_trid.trsvcid);
 				spdk_nvmf_qpair_disconnect(&slot->oqpair->qpair);
 			}
 			break;
@@ -1886,6 +1948,28 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 /* qpair / request stubs (no qpair is created until the sideband accepts)     */
 /* -------------------------------------------------------------------------- */
 
+/* Runs on the acceptor thread (sent from qpair_fini on the pg thread): free the
+ * ofi_qpair struct and clear the owning sideband conn's pointer to it, so the
+ * conn never dereferences a freed qpair. The EP teardown already ran on the pg
+ * thread in qpair_fini (FI_THREAD_DOMAIN); only the struct free moves here. */
+static void
+nvmf_ofi_qpair_free_msg(void *ctx)
+{
+	struct spdk_nvmf_ofi_qpair *oqpair = ctx;
+	struct spdk_nvmf_ofi_sb_conn *conn = oqpair->sb_conn;
+
+	oqpair->sb_conn = NULL;
+	if (conn != NULL) {
+		if (conn->oqpair == oqpair) {
+			conn->oqpair = NULL;
+		}
+		free(oqpair);
+		nvmf_ofi_sb_conn_release(conn);
+	} else {
+		free(oqpair);
+	}
+}
+
 static void
 nvmf_ofi_qpair_fini(struct spdk_nvmf_qpair *qpair,
 		    spdk_nvmf_transport_qpair_fini_cb cb_fn, void *cb_arg)
@@ -1895,10 +1979,21 @@ nvmf_ofi_qpair_fini(struct spdk_nvmf_qpair *qpair,
 
 	/* Runs on the pg thread (poll_group_remove already unlinked it). Close the
 	 * EP and drop the peer's AV entry. (P1c-2 adds capsule-buffer release.) */
-	SPDK_INFOLOG(nvmf_ofi, "qpair_fini: tearing down EP %p on pg thread %s\n",
-		     (void *)oqpair->ep, spdk_thread_get_name(spdk_get_thread()));
+	SPDK_INFOLOG(nvmf_ofi, "qpair_fini: tearing down EP %p qp=%p peer=%s:%s on pg thread %s\n",
+		     (void *)oqpair->ep, (void *)&oqpair->qpair,
+		     oqpair->peer_trid.traddr, oqpair->peer_trid.trsvcid,
+		     spdk_thread_get_name(spdk_get_thread()));
 	nvmf_ofi_ep_teardown(oqpair);
-	free(oqpair);
+
+	/* The acceptor thread owns conn->oqpair; if a sideband conn still references
+	 * this qpair, finish the struct free on that thread so the pointer is cleared
+	 * under the acceptor's single-threaded serialization (no dangling deref). */
+	if (oqpair->sb_conn != NULL) {
+		spdk_thread_send_msg(oqpair->sb_conn->acceptor_thread,
+				     nvmf_ofi_qpair_free_msg, oqpair);
+	} else {
+		free(oqpair);
+	}
 
 	if (cb_fn != NULL) {
 		cb_fn(cb_arg);
