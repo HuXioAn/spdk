@@ -34,6 +34,10 @@
 #include "spdk/string.h"
 #include "spdk/util.h"
 #include "spdk/log.h"
+#include "spdk/trace.h"
+#include "spdk/json.h"
+
+#include "spdk_internal/trace_defs.h"
 
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
@@ -197,6 +201,19 @@ struct spdk_nvmf_ofi_sb_conn {
  * pg thread in poll_group_create; all libfabric objects below are touched only
  * by that thread.
  */
+/* Per-poll-group statistics (dumped via poll_group_dump_stat / the nvmf_get_stats
+ * RPC). One poll group per SPDK thread; all fields touched only on that thread. */
+struct spdk_nvmf_ofi_pg_stat {
+	uint64_t	polls;			/* poll_group_poll invocations */
+	uint64_t	idle_polls;		/* polls that reaped 0 completions */
+	uint64_t	recv_cmds;		/* commands received (cq_rx) */
+	uint64_t	sent_cqes;		/* CQEs delivered (MSG + #46 folded-as-CQ-data) */
+	uint64_t	rma_reads;		/* V2 target fi_read (NVMe WRITE: pull host data) */
+	uint64_t	rma_writes;		/* V2 target fi_write/fi_writemsg (NVMe READ) */
+	uint64_t	cq_errors;		/* cq_tx/cq_rx -FI_EAVAIL */
+	uint64_t	recv_repost_defer;	/* recv re-posts deferred to pending_recvs (F4) */
+};
+
 struct spdk_nvmf_ofi_poll_group {
 	struct spdk_nvmf_transport_poll_group	group;
 	struct spdk_nvmf_ofi_transport		*transport;
@@ -206,6 +223,8 @@ struct spdk_nvmf_ofi_poll_group {
 	struct fid_av				*av;
 	struct fid_cq				*cq_tx;
 	struct fid_cq				*cq_rx;
+
+	struct spdk_nvmf_ofi_pg_stat		stat;
 
 	TAILQ_HEAD(, spdk_nvmf_ofi_qpair)	qpairs;
 	TAILQ_ENTRY(spdk_nvmf_ofi_poll_group)	link;
@@ -396,6 +415,34 @@ nvmf_ofi_getinfo(const char *prov, struct fi_info **out_info)
 /* -------------------------------------------------------------------------- */
 
 static int nvmf_ofi_accept(void *ctx);
+
+/* Tracepoint registration. Auto-run at process startup via the constructor macro
+ * (group name "nvmf_ofi"); enable at runtime with `rpc trace_enable_tpoint_group
+ * nvmf_ofi`, view via `rpc trace_get_info` / the trace shm. Mirrors tcp.c's
+ * nvmf_tcp_trace. The per-request tracepoints use object_id = the req pointer (a
+ * per-request timeline); qpair-level ones use OBJECT_NONE. */
+static void
+nvmf_ofi_trace(void)
+{
+	spdk_trace_register_owner_type(OWNER_TYPE_NVMF_OFI, 'o');
+	spdk_trace_register_object(OBJECT_NVMF_OFI_IO, 'r');
+
+	spdk_trace_register_description("OFI_QP_CREATE", TRACE_OFI_QP_CREATE,
+			OWNER_TYPE_NVMF_OFI, OBJECT_NONE, 0, SPDK_TRACE_ARG_TYPE_INT, "");
+	spdk_trace_register_description("OFI_QP_DESTROY", TRACE_OFI_QP_DESTROY,
+			OWNER_TYPE_NVMF_OFI, OBJECT_NONE, 0, SPDK_TRACE_ARG_TYPE_INT, "");
+	spdk_trace_register_description("OFI_RECV_CMD", TRACE_OFI_RECV_CMD,
+			OWNER_TYPE_NVMF_OFI, OBJECT_NVMF_OFI_IO, 1, SPDK_TRACE_ARG_TYPE_INT, "cid");
+	spdk_trace_register_description("OFI_SEND_CQE", TRACE_OFI_SEND_CQE,
+			OWNER_TYPE_NVMF_OFI, OBJECT_NVMF_OFI_IO, 0, SPDK_TRACE_ARG_TYPE_INT, "cid");
+	spdk_trace_register_description("OFI_RMA_READ", TRACE_OFI_RMA_READ,
+			OWNER_TYPE_NVMF_OFI, OBJECT_NVMF_OFI_IO, 0, SPDK_TRACE_ARG_TYPE_INT, "len");
+	spdk_trace_register_description("OFI_RMA_WRITE", TRACE_OFI_RMA_WRITE,
+			OWNER_TYPE_NVMF_OFI, OBJECT_NVMF_OFI_IO, 0, SPDK_TRACE_ARG_TYPE_INT, "len");
+	spdk_trace_register_description("OFI_CQ_ERROR", TRACE_OFI_CQ_ERROR,
+			OWNER_TYPE_NVMF_OFI, OBJECT_NONE, 0, SPDK_TRACE_ARG_TYPE_INT, "cq");
+}
+SPDK_TRACE_REGISTER_FN(nvmf_ofi_trace, "nvmf_ofi", TRACE_GROUP_NVMF_OFI)
 
 static void
 nvmf_ofi_opts_init(struct spdk_nvmf_transport_opts *opts)
@@ -1455,6 +1502,15 @@ nvmf_ofi_post_rma(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_req *
 
 	oreq->rma_is_read = is_read;
 	oreq->rma_with_cqe = false;
+	if (is_read) {
+		oqpair->group->stat.rma_reads++;
+		spdk_trace_record(TRACE_OFI_RMA_READ, oqpair->qpair.trace_id, 0,
+				  (uintptr_t)oreq, oreq->req.length);
+	} else {
+		oqpair->group->stat.rma_writes++;
+		spdk_trace_record(TRACE_OFI_RMA_WRITE, oqpair->qpair.trace_id, 0,
+				  (uintptr_t)oreq, oreq->req.length);
+	}
 	rc = nvmf_ofi_issue_rma(oqpair, oreq);
 	if (rc == -FI_EAGAIN) {
 		TAILQ_INSERT_TAIL(&oqpair->pending_rma, oreq, link);
@@ -1480,6 +1536,9 @@ nvmf_ofi_post_rma_cqe(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_r
 
 	oreq->rma_is_read = false;
 	oreq->rma_with_cqe = true;
+	oqpair->group->stat.rma_writes++;	/* #46: the fold write delivers the CQE */
+	spdk_trace_record(TRACE_OFI_RMA_WRITE, oqpair->qpair.trace_id, 0,
+			  (uintptr_t)oreq, oreq->req.length);
 	rc = nvmf_ofi_issue_rma(oqpair, oreq);
 	if (rc == -FI_EAGAIN) {
 		TAILQ_INSERT_TAIL(&oqpair->pending_rma, oreq, link);
@@ -1637,6 +1696,7 @@ nvmf_ofi_req_release(struct spdk_nvmf_ofi_req *req)
 			 * Queue the slot instead of dropping it — a dropped recv slot
 			 * permanently shrinks the pool and starves the qpair. Retried at the
 			 * top of the next poll_group_poll (draining cq_tx frees resources). */
+			oqpair->group->stat.recv_repost_defer++;
 			TAILQ_INSERT_TAIL(&oqpair->pending_recvs, req->recv_slot, link);
 		}
 		req->recv_slot = NULL;
@@ -1766,6 +1826,12 @@ nvmf_ofi_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	oqpair->pools_ready = true;
 
 	TAILQ_INSERT_TAIL(&opgroup->qpairs, oqpair, link);
+	{
+		char owner[64];
+		snprintf(owner, sizeof(owner), "nvmf_ofi_qpair %u", oqpair->qpair.qid);
+		oqpair->qpair.trace_id = spdk_trace_register_owner(OWNER_TYPE_NVMF_OFI, owner);
+		spdk_trace_record(TRACE_OFI_QP_CREATE, oqpair->qpair.trace_id, 0, 0);
+	}
 	SPDK_INFOLOG(nvmf_ofi, "qpair added to pg thread %s (ep=%p qp=%p peer=%s:%s peer_fi_addr=0x%lx qd=%u)\n",
 		     spdk_thread_get_name(opgroup->thread), (void *)oqpair->ep, (void *)&oqpair->qpair,
 		     oqpair->peer_trid.traddr, oqpair->peer_trid.trsvcid,
@@ -1810,6 +1876,8 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	uint32_t reaped = 0, batch;
 	ssize_t rc;
 
+	opgroup->stat.polls++;
+
 	/* Re-post recv slots whose re-post was deferred on -FI_EAGAIN, before
 	 * draining — so they can receive the commands we are about to pull. */
 	nvmf_ofi_drain_pending_recv(opgroup);
@@ -1840,12 +1908,14 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			 * err.op_context is the failed op's context, which is always the
 			 * owning req here (issue_rma / issue_send both pass oreq). */
 			oreq = err.op_context;
+			opgroup->stat.cq_errors++;
 			if (oreq != NULL) {
 				SPDK_NOTICELOG("ofi target: cq_tx-err disconnect qpair=%p peer=%s:%s\n",
 					       (void *)&oreq->oqpair->qpair,
 					       oreq->oqpair->peer_trid.traddr,
 					       oreq->oqpair->peer_trid.trsvcid);
-				spdk_nvmf_qpair_disconnect(&oreq->oqpair->qpair);
+				spdk_trace_record(TRACE_OFI_CQ_ERROR, oreq->oqpair->qpair.trace_id, 0, 0, 0 /*cq_tx*/);
+			spdk_nvmf_qpair_disconnect(&oreq->oqpair->qpair);
 			}
 			break;
 		}
@@ -1901,12 +1971,14 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			 * is the recv buffer's slot (the success path also reads it as the
 			 * slot at entry.op_context). */
 			slot = err.op_context;
+			opgroup->stat.cq_errors++;
 			if (slot != NULL) {
 				SPDK_NOTICELOG("ofi target: cq_rx-err disconnect qpair=%p peer=%s:%s\n",
 					       (void *)&slot->oqpair->qpair,
 					       slot->oqpair->peer_trid.traddr,
 					       slot->oqpair->peer_trid.trsvcid);
-				spdk_nvmf_qpair_disconnect(&slot->oqpair->qpair);
+				spdk_trace_record(TRACE_OFI_CQ_ERROR, slot->oqpair->qpair.trace_id, 0, 0, 1 /*cq_rx*/);
+			spdk_nvmf_qpair_disconnect(&slot->oqpair->qpair);
 			}
 			break;
 		}
@@ -1941,6 +2013,9 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			req->use_rma = false;
 			SPDK_DEBUGLOG(nvmf_ofi, "ofi target: recv cmd opc=0x%x cid=%u len=%zu xfer=%u\n",
 				       sqe->opc, sqe->cid, entry.len, req->req.xfer);
+			opgroup->stat.recv_cmds++;
+			spdk_trace_record(TRACE_OFI_RECV_CMD, oqpair->qpair.trace_id, 0,
+					  (uintptr_t)req, sqe->cid);
 
 			/* V2: a keyed SGL means the host advertised a remote buffer; the data
 			 * moves over target-initiated RMA, not in-capsule. (V1's DATA_BLOCK /
@@ -1998,9 +2073,9 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 				/* HOST_TO_CONTROLLER in-capsule data (e.g. CONNECT/WRITE). */
 				data_len = entry.len - sizeof(struct spdk_nvme_cmd);
 				if (sqe->opc == SPDK_NVME_OPC_FABRIC && data_len >= 1024) {
-					const char *cd = (char *)slot->buf + sizeof(struct spdk_nvme_cmd);
 					SPDK_DEBUGLOG(nvmf_ofi, "ofi target: connect data subnqn='%s' hostnqn='%s'\n",
-						       cd + 256, cd + 512);
+						       (char *)slot->buf + sizeof(struct spdk_nvme_cmd) + 256,
+						       (char *)slot->buf + sizeof(struct spdk_nvme_cmd) + 512);
 				}
 				req->req.iov[0].iov_base = (char *)slot->buf + sizeof(struct spdk_nvme_cmd);
 				req->req.iov[0].iov_len = data_len;
@@ -2024,6 +2099,9 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 		}
 	}
 
+	if (reaped == 0) {
+		opgroup->stat.idle_polls++;
+	}
 	return reaped;
 }
 
@@ -2062,6 +2140,7 @@ nvmf_ofi_qpair_fini(struct spdk_nvmf_qpair *qpair,
 
 	/* Runs on the pg thread (poll_group_remove already unlinked it). Close the
 	 * EP and drop the peer's AV entry. (P1c-2 adds capsule-buffer release.) */
+	spdk_trace_record(TRACE_OFI_QP_DESTROY, oqpair->qpair.trace_id, 0, 0);
 	SPDK_INFOLOG(nvmf_ofi, "qpair_fini: tearing down EP %p qp=%p peer=%s:%s on pg thread %s\n",
 		     (void *)oqpair->ep, (void *)&oqpair->qpair,
 		     oqpair->peer_trid.traddr, oqpair->peer_trid.trsvcid,
@@ -2164,6 +2243,12 @@ nvmf_ofi_req_complete(struct spdk_nvmf_request *req)
 	/* Build the CQE into the send buffer. */
 	memcpy(oreq->send_buf, rsp, sizeof(*rsp));
 
+	/* Every completion path (V1 MSG, V2 separate-CQE, V2 #46 CQE-fold) produces
+	 * exactly one CQE for this req. */
+	oreq->oqpair->group->stat.sent_cqes++;
+	spdk_trace_record(TRACE_OFI_SEND_CQE, oreq->oqpair->qpair.trace_id, 0,
+			  (uintptr_t)oreq, rsp->cid);
+
 	if (oreq->use_rma) {
 		/* V2: data (if any) moves over RMA, never in-capsule. */
 		if (spdk_nvme_cpl_is_success(rsp) &&
@@ -2240,6 +2325,48 @@ nvmf_ofi_listen_associate(struct spdk_nvmf_transport *transport,
 /* Ops table + registration                                                   */
 /* -------------------------------------------------------------------------- */
 
+/* Dump transport runtime config (mirrors tcp.c dump_opts). Surfaced via the
+ * nvmf_get_transports RPC path (nvmf_transport_dump_opts). */
+static void
+nvmf_ofi_dump_opts(struct spdk_nvmf_transport *transport, struct spdk_json_write_ctx *w)
+{
+	struct spdk_nvmf_ofi_transport *otransport =
+		SPDK_CONTAINEROF(transport, struct spdk_nvmf_ofi_transport, transport);
+
+	assert(w != NULL);
+	spdk_json_write_named_string(w, "provider", otransport->provider);
+	spdk_json_write_named_string(w, "addr_format",
+				     otransport->info->addr_format == FI_ADDR_CXI ? "CXI" : "SOCKADDR");
+	spdk_json_write_named_uint64(w, "mr_mode",
+				     (uint64_t)otransport->info->domain_attr->mr_mode);
+	spdk_json_write_named_uint32(w, "max_queue_depth",
+				     otransport->transport.opts.max_queue_depth);
+	spdk_json_write_named_uint32(w, "in_capsule_data_size",
+				     otransport->transport.opts.in_capsule_data_size);
+	spdk_json_write_named_uint32(w, "max_io_size",
+				     otransport->transport.opts.max_io_size);
+}
+
+/* Dump per-poll-group statistics (mirrors rdma.c poll_group_dump_stat). Surfaced
+ * via the nvmf_get_stats RPC. */
+static void
+nvmf_ofi_poll_group_dump_stat(struct spdk_nvmf_transport_poll_group *group,
+			      struct spdk_json_write_ctx *w)
+{
+	struct spdk_nvmf_ofi_poll_group *opgroup =
+		SPDK_CONTAINEROF(group, struct spdk_nvmf_ofi_poll_group, group);
+
+	assert(w != NULL);
+	spdk_json_write_named_uint64(w, "polls", opgroup->stat.polls);
+	spdk_json_write_named_uint64(w, "idle_polls", opgroup->stat.idle_polls);
+	spdk_json_write_named_uint64(w, "recv_cmds", opgroup->stat.recv_cmds);
+	spdk_json_write_named_uint64(w, "sent_cqes", opgroup->stat.sent_cqes);
+	spdk_json_write_named_uint64(w, "rma_reads", opgroup->stat.rma_reads);
+	spdk_json_write_named_uint64(w, "rma_writes", opgroup->stat.rma_writes);
+	spdk_json_write_named_uint64(w, "cq_errors", opgroup->stat.cq_errors);
+	spdk_json_write_named_uint64(w, "recv_repost_defer", opgroup->stat.recv_repost_defer);
+}
+
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ofi = {
 	.name = "OFI",
 	.type = SPDK_NVME_TRANSPORT_CUSTOM_FABRICS,
@@ -2254,6 +2381,7 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ofi = {
 
 	.cdata_init = nvmf_ofi_cdata_init,
 	.listener_discover = nvmf_ofi_listener_discover,
+	.dump_opts = nvmf_ofi_dump_opts,
 
 	.subsystem_add_ns = nvmf_ofi_subsystem_add_ns,
 
@@ -2263,6 +2391,7 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ofi = {
 	.poll_group_add = nvmf_ofi_poll_group_add,
 	.poll_group_remove = nvmf_ofi_poll_group_remove,
 	.poll_group_poll = nvmf_ofi_poll_group_poll,
+	.poll_group_dump_stat = nvmf_ofi_poll_group_dump_stat,
 
 	.req_free = nvmf_ofi_req_free,
 	.req_complete = nvmf_ofi_req_complete,
