@@ -36,6 +36,8 @@
 #include "spdk/util.h"
 #include "spdk/log.h"
 #include "spdk/dma.h"
+#include "spdk/trace.h"
+#include "spdk_internal/trace_defs.h"
 
 #include "nvme_internal.h"
 
@@ -788,6 +790,9 @@ nvme_ofi_complete_request(struct nvme_ofi_qpair *tqpair, uint16_t cid,
 		       spdk_min(data_len, req->payload_size));
 	}
 
+	spdk_trace_record(TRACE_NVME_OFI_HOST_COMPLETE, tqpair->qpair.id, 0, (uintptr_t)req,
+			  (uintptr_t)req->cb_arg, (uint32_t)cid, (uint32_t)cpl->status.sc);
+
 	rsp = *cpl;
 	/* nvme_complete_request invokes the user callback (right signature) + frees req. */
 	nvme_complete_request(req->cb_fn, req->cb_arg, req->qpair, req, &rsp);
@@ -1073,6 +1078,7 @@ nvme_ofi_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 
 	SPDK_INFOLOG(nvme_ofi, "ofi host qpair %u created (qsize=%u mr_local=%d)\n",
 		     qid, qsize, tqpair->mr_local);
+	spdk_trace_record(TRACE_NVME_OFI_HOST_QP_CREATE, tqpair->qpair.id, 0, 0, qsize);
 	return &tqpair->qpair;
 
 err:
@@ -1085,6 +1091,8 @@ static void
 nvme_ofi_qpair_free_res(struct nvme_ofi_qpair *tqpair)
 {
 	uint32_t i;
+
+	spdk_trace_record(TRACE_NVME_OFI_HOST_QP_DESTROY, tqpair->qpair.id, 0, 0, tqpair->qpair.id);
 
 	if (tqpair->recv_slots) {
 		for (i = 0; i < tqpair->num_slots; i++) {
@@ -1205,6 +1213,7 @@ nvme_ofi_drain_cq(struct nvme_ofi_qpair *tqpair, uint32_t max_completions)
 			SPDK_ERRLOG("ofi host: CQ error err=%d(%s) prov=%d flags=0x%lx len=%zu olen=%zu\n",
 				    err.err, fi_strerror(err.err), err.prov_errno,
 				    (unsigned long)err.flags, err.len, err.olen);
+			spdk_trace_record(TRACE_NVME_OFI_HOST_CQ_ERROR, tqpair->qpair.id, 0, 0, err.err);
 			nvme_ctrlr_disconnect_qpair(&tqpair->qpair);
 			return -ENXIO;
 		}
@@ -1409,6 +1418,7 @@ nvme_ofi_connect_poll(struct nvme_ofi_qpair *tqpair)
 			}
 			nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTED);
 			SPDK_NOTICELOG("ofi host qpair %u CONNECTED (fabrics connect ok)\n", qpair->id);
+			spdk_trace_record(TRACE_NVME_OFI_HOST_CONNECT, tqpair->qpair.id, 0, 0, qpair->id);
 			tqpair->sb_state = NVME_OFI_SB_READY;
 			return 0;
 
@@ -1609,6 +1619,7 @@ nvme_ofi_mr_get(struct nvme_ofi_qpair *tqpair, void *buf, size_t len,
 	e->key = key;
 	e->refcnt = 1;
 	tqpair->mr_reg++;
+	spdk_trace_record(TRACE_NVME_OFI_HOST_MR_REG, tqpair->qpair.id, 0, 0, (uint32_t)len);
 
 	*out_addr = addr;
 	*out_key = key;
@@ -1839,6 +1850,8 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 		/* inject completes inline: no slot held, no tx completion to recycle. The
 		 * cid stays reserved in req_table until the response CQE arrives. */
 		tqpair->req_table[cid] = req;
+		spdk_trace_record(TRACE_NVME_OFI_HOST_SUBMIT, tqpair->qpair.id, 0, (uintptr_t)req,
+				  (uintptr_t)req->cb_arg, (uint32_t)cid);
 		return 0;
 	}
 
@@ -1873,6 +1886,8 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	slot->busy = true;
 	slot->cid = cid;
 	tqpair->req_table[cid] = req;
+	spdk_trace_record(TRACE_NVME_OFI_HOST_SUBMIT, tqpair->qpair.id, 0, (uintptr_t)req,
+			  (uintptr_t)req->cb_arg, (uint32_t)cid);
 	return 0;
 }
 
@@ -2100,3 +2115,59 @@ const struct spdk_nvme_transport_ops nvme_ofi_ops = {
 
 SPDK_NVME_TRANSPORT_REGISTER(ofi, &nvme_ofi_ops);
 SPDK_LOG_REGISTER_COMPONENT(nvme_ofi)
+
+/* Host (initiator) tracepoints — Phase 2 of P1g observability. Separate group
+ * 0x13 / owner 0x32 / object 0x70 from the target (lib/nvmf, group 0x7): nvmf_tgt
+ * links both lib/nvmf and lib/nvme, so the IDs must not collide. Mirrors nvme_tcp.c
+ * (owner_type + object registered globally; per-event owner_id = qpair->id, no
+ * per-qpair owner registration). spdk_trace_record early-outs when the group is
+ * disabled, so these are near-free on the hot path by default. */
+static void
+nvme_ofi_host_trace(void)
+{
+	struct spdk_trace_tpoint_opts opts[] = {
+		{
+			"OFI_H_QP_CREATE", TRACE_NVME_OFI_HOST_QP_CREATE,
+			OWNER_TYPE_NVME_OFI_HOST_QP, OBJECT_NONE, 0,
+			{	{ "qsize", SPDK_TRACE_ARG_TYPE_INT, 4 }, }
+		},
+		{
+			"OFI_H_QP_DESTROY", TRACE_NVME_OFI_HOST_QP_DESTROY,
+			OWNER_TYPE_NVME_OFI_HOST_QP, OBJECT_NONE, 0,
+			{	{ "qid", SPDK_TRACE_ARG_TYPE_INT, 4 }, }
+		},
+		{
+			"OFI_H_SUBMIT", TRACE_NVME_OFI_HOST_SUBMIT,
+			OWNER_TYPE_NVME_OFI_HOST_QP, OBJECT_NVME_OFI_HOST_REQ, 1,
+			{	{ "ctx", SPDK_TRACE_ARG_TYPE_PTR, 8 },
+				{ "cid", SPDK_TRACE_ARG_TYPE_INT, 4 }, }
+		},
+		{
+			"OFI_H_COMPLETE", TRACE_NVME_OFI_HOST_COMPLETE,
+			OWNER_TYPE_NVME_OFI_HOST_QP, OBJECT_NVME_OFI_HOST_REQ, 0,
+			{	{ "ctx", SPDK_TRACE_ARG_TYPE_PTR, 8 },
+				{ "cid", SPDK_TRACE_ARG_TYPE_INT, 4 },
+				{ "sc", SPDK_TRACE_ARG_TYPE_INT, 4 }, }
+		},
+		{
+			"OFI_H_CQ_ERROR", TRACE_NVME_OFI_HOST_CQ_ERROR,
+			OWNER_TYPE_NVME_OFI_HOST_QP, OBJECT_NONE, 0,
+			{	{ "err", SPDK_TRACE_ARG_TYPE_INT, 4 }, }
+		},
+		{
+			"OFI_H_CONNECT", TRACE_NVME_OFI_HOST_CONNECT,
+			OWNER_TYPE_NVME_OFI_HOST_QP, OBJECT_NONE, 0,
+			{	{ "qid", SPDK_TRACE_ARG_TYPE_INT, 4 }, }
+		},
+		{
+			"OFI_H_MR_REG", TRACE_NVME_OFI_HOST_MR_REG,
+			OWNER_TYPE_NVME_OFI_HOST_QP, OBJECT_NONE, 0,
+			{	{ "len", SPDK_TRACE_ARG_TYPE_INT, 4 }, }
+		},
+	};
+
+	spdk_trace_register_object(OBJECT_NVME_OFI_HOST_REQ, 'R');
+	spdk_trace_register_owner_type(OWNER_TYPE_NVME_OFI_HOST_QP, 'h');
+	spdk_trace_register_description_ext(opts, SPDK_COUNTOF(opts));
+}
+SPDK_TRACE_REGISTER_FN(nvme_ofi_host_trace, "nvme_ofi_host", TRACE_GROUP_NVME_OFI_HOST)
