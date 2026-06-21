@@ -79,6 +79,10 @@
  * get SEPARATE budgets (a shared counter starved cq_rx whenever cq_tx filled it). */
 #define NVMF_OFI_CQ_DRAIN_BATCH		64
 
+/* CQ entries reaped per fi_cq_read call (amortizes the per-completion libfabric
+ * call overhead vs reading one at a time). Bounded by the per-CQ drain budget. */
+#define NVMF_OFI_CQ_READ_BATCH		16
+
 /* Bounded retry count for re-posting a recv buffer on -FI_EAGAIN. Was unbounded
  * (do/while) — a persistent EAGAIN could wedge the reactor thread inside
  * poll_group_poll. On exhaustion the slot is queued to the qpair's pending_recvs
@@ -1871,10 +1875,10 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
 	struct spdk_nvmf_ofi_poll_group *opgroup =
 		SPDK_CONTAINEROF(group, struct spdk_nvmf_ofi_poll_group, group);
-	struct fi_cq_data_entry entry;
+	struct fi_cq_data_entry entries[NVMF_OFI_CQ_READ_BATCH];
 	struct fi_cq_err_entry err;
 	uint32_t reaped = 0, batch;
-	ssize_t rc;
+	ssize_t rc, k;
 
 	opgroup->stat.polls++;
 
@@ -1888,7 +1892,9 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	 * the batch, leaving commands unprocessed that poll. */
 	batch = 0;
 	while (batch < NVMF_OFI_CQ_DRAIN_BATCH) {
-		rc = fi_cq_read(opgroup->cq_tx, &entry, 1);
+		uint32_t want = spdk_min(NVMF_OFI_CQ_READ_BATCH, NVMF_OFI_CQ_DRAIN_BATCH - batch);
+
+		rc = fi_cq_read(opgroup->cq_tx, entries, want);
 		if (rc == -FI_EAGAIN) {
 			break;
 		}
@@ -1923,9 +1929,7 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			SPDK_ERRLOG("ofi target: cq_tx fi_cq_read: %zd\n", rc);
 			break;
 		}
-		reaped++;
-		batch++;
-		{
+		for (k = 0; k < rc; k++) {
 			/* TX completion. Three kinds land on cq_tx, distinguished by the
 			 * op flags (the op_context is always the req):
 			 *  - FI_READ : a V2 fi_read finished — host WRITE data is now in
@@ -1935,9 +1939,11 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			 *    now send the CQE.
 			 *  - else (FI_SEND): the response MSG was sent — recycle the req
 			 *    (this also re-posts the recv slot it was holding). */
-			struct spdk_nvmf_ofi_req *oreq = entry.op_context;
+			struct spdk_nvmf_ofi_req *oreq = entries[k].op_context;
 
-			if (entry.flags & (FI_READ | FI_WRITE)) {
+			reaped++;
+			batch++;
+			if (entries[k].flags & (FI_READ | FI_WRITE)) {
 				nvmf_ofi_rma_done(oreq);
 			} else {
 				oreq->send_in_flight = false;
@@ -1955,7 +1961,9 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	 * independent of how many tx completions were reaped above.) */
 	batch = 0;
 	while (batch < NVMF_OFI_CQ_DRAIN_BATCH) {
-		rc = fi_cq_read(opgroup->cq_rx, &entry, 1);
+		uint32_t want = spdk_min(NVMF_OFI_CQ_READ_BATCH, NVMF_OFI_CQ_DRAIN_BATCH - batch);
+
+		rc = fi_cq_read(opgroup->cq_rx, entries, want);
 		if (rc == -FI_EAGAIN) {
 			break;
 		}
@@ -1986,15 +1994,15 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			SPDK_ERRLOG("ofi target: cq_rx fi_cq_read: %zd\n", rc);
 			break;
 		}
-		reaped++;
-		batch++;
-		{
-			struct spdk_nvmf_ofi_recv_slot *slot = entry.op_context;
+		for (k = 0; k < rc; k++) {
+			struct spdk_nvmf_ofi_recv_slot *slot = entries[k].op_context;
 			struct spdk_nvmf_ofi_qpair *oqpair = slot->oqpair;
 			struct spdk_nvmf_ofi_req *req;
 			struct spdk_nvme_cmd *sqe;
 			uint32_t data_len;
 
+			reaped++;
+			batch++;
 			slot->posted = false;
 			req = nvmf_ofi_req_get(oqpair);
 			if (req == NULL) {
@@ -2012,7 +2020,7 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			req->recv_slot = slot;	/* hold the slot for zero-copy H2C data */
 			req->use_rma = false;
 			SPDK_DEBUGLOG(nvmf_ofi, "ofi target: recv cmd opc=0x%x cid=%u len=%zu xfer=%u\n",
-				       sqe->opc, sqe->cid, entry.len, req->req.xfer);
+				       sqe->opc, sqe->cid, entries[k].len, req->req.xfer);
 			opgroup->stat.recv_cmds++;
 			spdk_trace_record(TRACE_OFI_RECV_CMD, oqpair->qpair.trace_id, 0,
 					  (uintptr_t)req, sqe->cid);
@@ -2069,9 +2077,9 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 				continue;
 			}
 
-			if (entry.len > sizeof(struct spdk_nvme_cmd)) {
+			if (entries[k].len > sizeof(struct spdk_nvme_cmd)) {
 				/* HOST_TO_CONTROLLER in-capsule data (e.g. CONNECT/WRITE). */
-				data_len = entry.len - sizeof(struct spdk_nvme_cmd);
+				data_len = entries[k].len - sizeof(struct spdk_nvme_cmd);
 				if (sqe->opc == SPDK_NVME_OPC_FABRIC && data_len >= 1024) {
 					SPDK_DEBUGLOG(nvmf_ofi, "ofi target: connect data subnqn='%s' hostnqn='%s'\n",
 						       (char *)slot->buf + sizeof(struct spdk_nvme_cmd) + 256,

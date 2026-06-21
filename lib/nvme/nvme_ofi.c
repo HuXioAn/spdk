@@ -81,6 +81,10 @@
  * iov_limit — set high enough to avoid the core splitting typical IOs. */
 #define NVME_OFI_MAX_SGES		32
 
+/* CQ entries reaped per fi_cq_read call. Batching amortizes the per-completion
+ * libfabric call overhead (vs reading one at a time). */
+#define NVME_OFI_CQ_BATCH		16
+
 /* Per-qpair recv/send slot counts == submission-queue depth. The host pre-posts
  * `qdepth` recv buffers (one per possible outstanding CID) and has `qdepth`
  * send slots. */
@@ -1216,10 +1220,10 @@ nvme_ofi_drain_pending_recv(struct nvme_ofi_qpair *tqpair)
 static int
 nvme_ofi_drain_cq(struct nvme_ofi_qpair *tqpair, uint32_t max_completions)
 {
-	struct fi_cq_data_entry entry;
+	struct fi_cq_data_entry entries[NVME_OFI_CQ_BATCH];
 	struct fi_cq_err_entry err;
 	uint32_t reaped = 0;
-	ssize_t rc;
+	ssize_t rc, k;
 
 	if (!tqpair->ep_enabled) {
 		return 0;
@@ -1230,7 +1234,9 @@ nvme_ofi_drain_cq(struct nvme_ofi_qpair *tqpair, uint32_t max_completions)
 	}
 
 	while (reaped < max_completions) {
-		rc = fi_cq_read(tqpair->cq, &entry, 1);
+		uint32_t want = spdk_min(NVME_OFI_CQ_BATCH, max_completions - reaped);
+
+		rc = fi_cq_read(tqpair->cq, entries, want);
 		if (rc == -FI_EAGAIN) {
 			break;
 		}
@@ -1249,49 +1255,52 @@ nvme_ofi_drain_cq(struct nvme_ofi_qpair *tqpair, uint32_t max_completions)
 			break;
 		}
 
-		if (entry.flags & FI_RECV) {
-			struct nvme_ofi_recv_slot *slot = entry.op_context;
-			uint64_t tag = entry.data;
-			uint16_t cid = NVME_OFI_TAG_CID(tag);
-			const struct spdk_nvme_cpl *cpl;
-			const void *data = NULL;
-			uint32_t data_len = 0;
+		for (k = 0; k < rc; k++) {
+			struct fi_cq_data_entry *e = &entries[k];
 
-			if (entry.len >= sizeof(struct spdk_nvme_cpl)) {
-				cpl = (const struct spdk_nvme_cpl *)slot->buf;
-				if (entry.len > sizeof(struct spdk_nvme_cpl)) {
-					data = (const char *)slot->buf + sizeof(struct spdk_nvme_cpl);
-					data_len = entry.len - sizeof(struct spdk_nvme_cpl);
+			if (e->flags & FI_RECV) {
+				struct nvme_ofi_recv_slot *slot = e->op_context;
+				uint16_t cid = NVME_OFI_TAG_CID(e->data);
+				const struct spdk_nvme_cpl *cpl;
+				const void *data = NULL;
+				uint32_t data_len = 0;
+
+				if (e->len >= sizeof(struct spdk_nvme_cpl)) {
+					cpl = (const struct spdk_nvme_cpl *)slot->buf;
+					if (e->len > sizeof(struct spdk_nvme_cpl)) {
+						data = (const char *)slot->buf + sizeof(struct spdk_nvme_cpl);
+						data_len = e->len - sizeof(struct spdk_nvme_cpl);
+					}
+					nvme_ofi_complete_request(tqpair, cid, cpl, data, data_len);
 				}
-				nvme_ofi_complete_request(tqpair, cid, cpl, data, data_len);
-			}
-			slot->posted = false;
-			if (nvme_ofi_post_recv(tqpair, slot) != 0) {
-				/* Provider recv resources exhausted (-FI_EAGAIN). Queue instead
-				 * of dropping — a dropped slot permanently shrinks the recv pool
-				 * and starves the qpair. Retried at the top of the next drain_cq. */
-				TAILQ_INSERT_TAIL(&tqpair->pending_recvs, slot, link);
-			}
-		} else if (entry.flags & FI_REMOTE_WRITE) {
-			/* #46: folded READ completion — the target's fi_write carried the CID
-			 * as CQ immediate data and the read data landed in our payload MR.
-			 * Synthesize a success CQE (fabrics ignores sqhd/phase; only cid +
-			 * success status matter) and complete. No recv buffer was consumed,
-			 * so nothing to re-post. */
-			uint16_t cid = NVME_OFI_TAG_CID(entry.data);
-			struct spdk_nvme_cpl cpl = {};
+				slot->posted = false;
+				if (nvme_ofi_post_recv(tqpair, slot) != 0) {
+					/* Provider recv resources exhausted (-FI_EAGAIN). Queue instead
+					 * of dropping — a dropped slot permanently shrinks the recv pool
+					 * and starves the qpair. Retried at the top of the next drain_cq. */
+					TAILQ_INSERT_TAIL(&tqpair->pending_recvs, slot, link);
+				}
+			} else if (e->flags & FI_REMOTE_WRITE) {
+				/* #46: folded READ completion — the target's fi_write carried the CID
+				 * as CQ immediate data and the read data landed in our payload MR.
+				 * Synthesize a success CQE (fabrics ignores sqhd/phase; only cid +
+				 * success status matter) and complete. No recv buffer was consumed,
+				 * so nothing to re-post. */
+				uint16_t cid = NVME_OFI_TAG_CID(e->data);
+				struct spdk_nvme_cpl cpl = {};
 
-			cpl.cid = cid;
-			cpl.status.sct = SPDK_NVME_SCT_GENERIC;
-			cpl.status.sc = SPDK_NVME_SC_SUCCESS;
-			nvme_ofi_complete_request(tqpair, cid, &cpl, NULL, 0);
-		} else {
-			/* TX completion (fi_sendmsg only — injects produce none): the slot
-			 * is done transmitting, return it to the free list (H1). */
-			struct nvme_ofi_send_slot *slot = entry.op_context;
-			TAILQ_INSERT_HEAD(&tqpair->send_free, slot, link);
+				cpl.cid = cid;
+				cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+				cpl.status.sc = SPDK_NVME_SC_SUCCESS;
+				nvme_ofi_complete_request(tqpair, cid, &cpl, NULL, 0);
+			} else {
+				/* TX completion (fi_sendmsg only — injects produce none): the slot
+				 * is done transmitting, return it to the free list (H1). */
+				struct nvme_ofi_send_slot *slot = e->op_context;
+				TAILQ_INSERT_HEAD(&tqpair->send_free, slot, link);
+			}
+			reaped++;
 		}
-		reaped++;
 	}
 	return (int)reaped;
 }
