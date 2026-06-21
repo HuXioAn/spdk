@@ -74,6 +74,10 @@
 /* V2 RMA single-transfer ceiling — MUST match the target's per-req bounce buffer
  * (NVMF_OFI_RMA_DATA_SIZE in lib/nvmf/ofi.c). */
 #define NVME_OFI_RMA_DATA_SIZE		131072
+/* Max SGL segments the V2 path accepts per command. Multi-segment payloads are gathered
+ * into one bounce buffer (one keyed SGL), so this is independent of the provider's
+ * iov_limit — set high enough to avoid the core splitting typical IOs. */
+#define NVME_OFI_MAX_SGES		32
 
 /* Per-qpair recv/send slot counts == submission-queue depth. The host pre-posts
  * `qdepth` recv buffers (one per possible outstanding CID) and has `qdepth`
@@ -214,13 +218,32 @@ struct nvme_ofi_send_slot {
  * re-register per IO (p0b_findings MR-cache), so cache by buffer vaddr. The
  * spdk_nvme_perf buffer pool is small + reused, so a flat linear cache suffices.
  */
-#define NVME_OFI_MR_CACHE_N	256
+#ifndef NVME_OFI_MR_CACHE_INIT
+#define NVME_OFI_MR_CACHE_INIT	256	/* test override: -DNVME_OFI_MR_CACHE_INIT=8 forces eviction */
+#endif
 struct nvme_ofi_mr_cache_entry {
 	void		*buf;
 	size_t		len;
 	struct fid_mr	*mr;
 	uint64_t	addr;	/* advertised remote addr: vaddr (FI_MR_VIRT_ADDR) or 0 */
 	uint64_t	key;	/* fi_mr_key */
+	uint16_t	refcnt;	/* outstanding V2 RMAs referencing this MR; eviction skips until 0 */
+	uint32_t	next_free;	/* free-list link (valid only when mr==NULL); UINT32_MAX = tail */
+};
+
+/* Gap B: bounce buffer for a multi-segment SGL payload, gathered into one contiguous
+ * DMA buffer so a single keyed SGL (one MR) can be advertised. Individually malloc'd so
+ * outstanding requests can hold a stable pointer (the pool never realloc's). */
+struct nvme_ofi_bounce {
+	void			*buf;	/* NVME_OFI_RMA_DATA_SIZE bytes, DMA-able */
+	struct nvme_ofi_bounce	*next;	/* free-list link */
+};
+
+/* Per-outstanding-CID transport-private state (parallel to req_table, indexed by cid). */
+struct nvme_ofi_outstanding {
+	uint32_t		mr_idx;		/* MR cache slot of this req's data MR; UINT32_MAX = none */
+	struct nvme_ofi_bounce	*bounce;	/* multi-seg bounce buf; NULL if contiguous */
+	bool			need_scatter;	/* CONTROLLER_TO_HOST into bounce → scatter on completion */
 };
 
 struct nvme_ofi_qpair {
@@ -269,10 +292,23 @@ struct nvme_ofi_qpair {
 	/* V2 RMA: when set, non-CONNECT data commands advertise a keyed SGL and the
 	 * target moves the data over RMA instead of in-capsule. */
 	bool				use_rma;
-	struct nvme_ofi_mr_cache_entry	mr_cache[NVME_OFI_MR_CACHE_N];
-	uint32_t			mr_cache_n;
+	/* V2 remote-data MR cache: a growable, indexed pool (no compaction on eviction, so
+	 * slot indices stay stable across realloc and can be held by outstanding requests).
+	 * #3: an entry is reclaimed only when refcnt==0 — an MR whose {addr,key} is still in
+	 * flight on the target is never fi_close'd. */
+	struct nvme_ofi_mr_cache_entry	*mr_cache;
+	uint32_t			mr_cache_cap;
+	uint32_t			mr_free_head;	/* first free slot, or UINT32_MAX */
 	uint64_t			mr_reg;		/* stat: registrations (cache miss) */
 	uint64_t			mr_hit;		/* stat: cache hits */
+	uint64_t			mr_evict;	/* stat: cold entries reclaimed */
+	uint64_t			mr_grow;	/* stat: pool grew (all entries in-flight) */
+
+	/* Gap B: multi-segment bounce-buffer free-list (lazy, bounded by QD in-flight). */
+	struct nvme_ofi_bounce		*bounce_free;
+
+	/* Per-CID outstanding state (parallel to req_table). */
+	struct nvme_ofi_outstanding	*outstanding;
 };
 
 struct nvme_ofi_ctrlr {
@@ -620,10 +656,103 @@ nvme_ofi_post_recv(struct nvme_ofi_qpair *tqpair, struct nvme_ofi_recv_slot *slo
 	}
 }
 
+/* Drop one outstanding reference on a cached MR (#3). Called when the request that
+ * advertised {addr,key} completes — by then the target's RMA is done, so the entry is
+ * safe to reclaim. */
+static void
+nvme_ofi_mr_put(struct nvme_ofi_qpair *tqpair, uint32_t idx)
+{
+	struct nvme_ofi_mr_cache_entry *e;
+
+	if (idx == UINT32_MAX || idx >= tqpair->mr_cache_cap) {
+		return;
+	}
+	e = &tqpair->mr_cache[idx];
+	assert(e->mr != NULL);
+	assert(e->refcnt > 0);
+	e->refcnt--;
+}
+
+/* Gap B: borrow a max_io_size DMA bounce buffer from the lazy per-qpair pool. */
+static struct nvme_ofi_bounce *
+nvme_ofi_bounce_get(struct nvme_ofi_qpair *tqpair)
+{
+	struct nvme_ofi_bounce *b = tqpair->bounce_free;
+
+	if (b != NULL) {
+		tqpair->bounce_free = b->next;
+		return b;
+	}
+	b = calloc(1, sizeof(*b));
+	if (b == NULL) {
+		return NULL;
+	}
+	b->buf = spdk_zmalloc(NVME_OFI_RMA_DATA_SIZE, 0, NULL, SPDK_ENV_LCORE_ID_ANY,
+			      SPDK_MALLOC_DMA);
+	if (b->buf == NULL) {
+		free(b);
+		return NULL;
+	}
+	return b;
+}
+
+static void
+nvme_ofi_bounce_put(struct nvme_ofi_qpair *tqpair, struct nvme_ofi_bounce *b)
+{
+	b->next = tqpair->bounce_free;
+	tqpair->bounce_free = b;
+}
+
+/* Gather an SGL payload into one contiguous buffer (NVMe WRITE direction). Mirrors the
+ * reset_sgl_fn + next_sge_fn walk nvme_rdma.c does (nvme_rdma.c:1625). */
+static int
+nvme_ofi_sgl_to_buf(const struct nvme_payload *p, uint32_t payload_offset,
+		    uint32_t payload_size, void *out)
+{
+	void *addr;
+	uint32_t len, off = 0;
+	int rc;
+
+	p->reset_sgl_fn(p->contig_or_cb_arg, payload_offset);
+	while (off < payload_size) {
+		rc = p->next_sge_fn(p->contig_or_cb_arg, &addr, &len);
+		if (rc != 0) {
+			return rc;
+		}
+		len = spdk_min(len, payload_size - off);
+		memcpy((char *)out + off, addr, len);
+		off += len;
+	}
+	return 0;
+}
+
+/* Scatter one contiguous buffer into an SGL payload (NVMe READ direction). */
+static int
+nvme_ofi_buf_to_sgl(const struct nvme_payload *p, uint32_t payload_offset,
+		    uint32_t payload_size, const void *in)
+{
+	void *addr;
+	uint32_t len, off = 0;
+	int rc;
+
+	p->reset_sgl_fn(p->contig_or_cb_arg, payload_offset);
+	while (off < payload_size) {
+		rc = p->next_sge_fn(p->contig_or_cb_arg, &addr, &len);
+		if (rc != 0) {
+			return rc;
+		}
+		len = spdk_min(len, payload_size - off);
+		memcpy(addr, (const char *)in + off, len);
+		off += len;
+	}
+	return 0;
+}
+
 static void
 nvme_ofi_complete_request(struct nvme_ofi_qpair *tqpair, uint16_t cid,
 			  const struct spdk_nvme_cpl *cpl, const void *data, uint32_t data_len)
 {
+	struct nvme_ofi_outstanding *o;
 	struct nvme_request *req;
 	struct spdk_nvme_cpl rsp;
 
@@ -632,10 +761,26 @@ nvme_ofi_complete_request(struct nvme_ofi_qpair *tqpair, uint16_t cid,
 		return;
 	}
 	req = tqpair->req_table[cid];
+	o = &tqpair->outstanding[cid];
 	tqpair->req_table[cid] = NULL;
 
+	/* Gap B: a multi-seg READ landed its data in a bounce buffer — scatter it back into
+	 * the caller's SGL before completing. (V2 RMA path, data==NULL here.) */
+	if (o->bounce != NULL && o->need_scatter && req->payload.reset_sgl_fn != NULL) {
+		nvme_ofi_buf_to_sgl(&req->payload, req->payload_offset, req->payload_size,
+				    o->bounce->buf);
+	}
+	/* Return the bounce buffer (if any) to the pool, then drop the data-MR reference
+	 * held since submit (#3) — by now the target's RMA is done. */
+	if (o->bounce != NULL) {
+		nvme_ofi_bounce_put(tqpair, o->bounce);
+		o->bounce = NULL;
+	}
+	nvme_ofi_mr_put(tqpair, o->mr_idx);
+	o->mr_idx = UINT32_MAX;
+
 	/* CONTROLLER_TO_HOST data (READ): copy the in-capsule data into the req payload
-	 * before completing. SGL payloads are not supported in V1 (single-segment). */
+	 * before completing. (V1 single-segment contig only; multi-seg is V2/bounce above.) */
 	if (data != NULL && data_len > 0 &&
 	    spdk_nvme_opc_get_data_transfer(req->cmd.opc) == SPDK_NVME_DATA_CONTROLLER_TO_HOST &&
 	    req->payload.reset_sgl_fn == NULL) {
@@ -777,8 +922,13 @@ nvme_ofi_ctrlr_get_max_xfer_size(struct spdk_nvme_ctrlr *ctrlr)
 static uint16_t
 nvme_ofi_ctrlr_get_max_sges(struct spdk_nvme_ctrlr *ctrlr)
 {
-	/* V1 = single-segment (CXI iov_limit=1). */
-	return 1;
+	struct nvme_ofi_ctrlr *tctrlr = nvme_ofi_ctrlr(ctrlr);
+
+	/* V1 = single-segment. V2 gathers multi-segment payloads into one bounce buffer
+	 * (design §6.3.2) and advertises a single keyed SGL, so the per-command segment
+	 * count is independent of the provider's iov_limit / rma_iov_limit — let the core
+	 * pass multi-segment IOs through instead of splitting them. */
+	return tctrlr->use_rma ? NVME_OFI_MAX_SGES : 1;
 }
 
 static int
@@ -872,11 +1022,25 @@ nvme_ofi_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 	tqpair->recv_slots = calloc(qsize, sizeof(*tqpair->recv_slots));
 	tqpair->send_slots = calloc(qsize, sizeof(*tqpair->send_slots));
 	tqpair->req_table = calloc(num_requests, sizeof(*tqpair->req_table));
+	tqpair->outstanding = calloc(num_requests, sizeof(*tqpair->outstanding));
+	/* V2 MR cache pool (growable; #3 refcounted, evict-only-cold). */
+	tqpair->mr_cache_cap = NVME_OFI_MR_CACHE_INIT;
+	tqpair->mr_cache = calloc(tqpair->mr_cache_cap, sizeof(*tqpair->mr_cache));
 	if (tqpair->recv_slots == NULL || tqpair->send_slots == NULL ||
-	    tqpair->req_table == NULL) {
+	    tqpair->req_table == NULL || tqpair->outstanding == NULL ||
+	    tqpair->mr_cache == NULL) {
 		goto err;
 	}
 	TAILQ_INIT(&tqpair->pending_recvs);
+	tqpair->bounce_free = NULL;
+	/* Chain every MR slot into the free list; mark every outstanding slot empty. */
+	for (i = 0; i < tqpair->mr_cache_cap; i++) {
+		tqpair->mr_cache[i].next_free = (i + 1 < tqpair->mr_cache_cap) ? (i + 1) : UINT32_MAX;
+	}
+	tqpair->mr_free_head = 0;
+	for (i = 0; i < num_requests; i++) {
+		tqpair->outstanding[i].mr_idx = UINT32_MAX;
+	}
 	for (i = 0; i < qsize; i++) {
 		tqpair->recv_slots[i].tqpair = tqpair;
 		tqpair->recv_slots[i].buf = spdk_zmalloc(NVME_OFI_RECV_BUF_SIZE, 0, NULL,
@@ -941,12 +1105,36 @@ nvme_ofi_qpair_free_res(struct nvme_ofi_qpair *tqpair)
 		free(tqpair->send_slots);
 	}
 	free(tqpair->req_table);
-	/* Close the V2 remote-data MRs (registered lazily by nvme_ofi_mr_get). */
-	for (i = 0; i < tqpair->mr_cache_n; i++) {
+	/* Post-mortem MR-cache summary — the host has no RPC server, so qpair teardown is
+	 * the only window to read the #3 counters (visible at --log-level notice). */
+	SPDK_NOTICELOG("ofi host qpair torn down: MR cache reg=%lu hit=%lu evict=%lu grow=%lu (final cap=%u)\n",
+		       tqpair->mr_reg, tqpair->mr_hit, tqpair->mr_evict, tqpair->mr_grow,
+		       tqpair->mr_cache_cap);
+	/* Close the V2 remote-data MRs (registered lazily by nvme_ofi_mr_get). EP is torn
+	 * down before free_res (delete_io_qpair → ep_teardown), so no RMA is in flight. */
+	for (i = 0; i < tqpair->mr_cache_cap; i++) {
 		if (tqpair->mr_cache[i].mr) {
 			fi_close(&tqpair->mr_cache[i].mr->fid);
 		}
 	}
+	free(tqpair->mr_cache);
+	/* Free all multi-seg bounce buffers: the free-list plus any still referenced by
+	 * outstanding requests the disconnect drain didn't complete (defensive — completion
+	 * clears outstanding[i].bounce first, so no double-free). */
+	if (tqpair->outstanding != NULL) {
+		for (i = 0; i < tqpair->req_table_sz; i++) {
+			if (tqpair->outstanding[i].bounce != NULL) {
+				spdk_free(tqpair->outstanding[i].bounce->buf);
+				free(tqpair->outstanding[i].bounce);
+				tqpair->outstanding[i].bounce = NULL;
+			}
+		}
+	}
+	{
+		struct nvme_ofi_bounce *b = tqpair->bounce_free, *bn;
+		while (b != NULL) { bn = b->next; spdk_free(b->buf); free(b); b = bn; }
+	}
+	free(tqpair->outstanding);
 	if (tqpair->cq) { fi_close(&tqpair->cq->fid); }
 	if (tqpair->av) { fi_close(&tqpair->av->fid); }
 	if (tqpair->domain) { fi_close(&tqpair->domain->fid); }
@@ -1307,11 +1495,16 @@ nvme_ofi_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 
 /*
  * Look up (or register) a remote-data MR for a host buffer and return the
- * {addr,key} the target needs to RMA into/out of it. Registered with both remote
- * READ (target fi_read for NVMe WRITE) and remote WRITE (target fi_write for NVMe
- * READ) so one MR serves either direction. Cached by buffer vaddr; on overflow
- * the oldest entry is closed and evicted (the perf buffer set is small, so this
- * is rare). bind/enable only on FI_MR_ENDPOINT (CXI).
+ * {addr,key} the target needs to RMA into/out of it, plus the cache slot index
+ * (*out_idx) the caller holds until the request completes — so the MR cannot be
+ * reclaimed while its {addr,key} is still in flight on the target (#3). Registered
+ * with both remote READ (target fi_read for NVMe WRITE) and remote WRITE (target
+ * fi_write for NVMe READ) so one MR serves either direction. bind/enable only on
+ * FI_MR_ENDPOINT (CXI).
+ *
+ * The cache is a growable, indexed pool with a free-list. On overflow the oldest
+ * entry with refcnt==0 (cold) is reclaimed; if EVERY entry is in flight the pool
+ * grows. An MR is therefore never fi_close'd while an outstanding RMA references it.
  *
  * Key handling: when the negotiated mr_mode has FI_MR_PROV_KEY (verbs;ofi_rxm,
  * CXI — AND tcp here, because the transport requests PROV_KEY in its getinfo
@@ -1322,7 +1515,7 @@ nvme_ofi_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
  */
 static int
 nvme_ofi_mr_get(struct nvme_ofi_qpair *tqpair, void *buf, size_t len,
-		uint64_t *out_addr, uint64_t *out_key)
+		uint64_t *out_addr, uint64_t *out_key, uint32_t *out_idx)
 {
 	struct nvme_ofi_ctrlr *tctrlr = tqpair->tctrlr;
 	const uint64_t access = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
@@ -1330,32 +1523,68 @@ nvme_ofi_mr_get(struct nvme_ofi_qpair *tqpair, void *buf, size_t len,
 	struct nvme_ofi_mr_cache_entry *e;
 	struct fid_mr *mr = NULL;
 	uint64_t key, addr, req_key;
-	uint32_t i;
+	uint32_t i, slot;
 	int rc;
 
-	for (i = 0; i < tqpair->mr_cache_n; i++) {
-		if (tqpair->mr_cache[i].buf == buf && tqpair->mr_cache[i].len >= len) {
+	/* 1. Lookup among live (registered) entries. */
+	for (i = 0; i < tqpair->mr_cache_cap; i++) {
+		e = &tqpair->mr_cache[i];
+		if (e->mr != NULL && e->buf == buf && e->len >= len) {
+			e->refcnt++;
 			tqpair->mr_hit++;
-			*out_addr = tqpair->mr_cache[i].addr;
-			*out_key = tqpair->mr_cache[i].key;
+			*out_addr = e->addr;
+			*out_key = e->key;
+			*out_idx = i;
 			return 0;
 		}
 	}
 
-	if (tqpair->mr_cache_n >= NVME_OFI_MR_CACHE_N) {
-		/* Evict the oldest entry (FIFO). */
-		if (tqpair->mr_cache[0].mr) {
-			fi_close(&tqpair->mr_cache[0].mr->fid);
+	/* 2. Ensure a free slot: evict a cold entry, or grow the pool. */
+	if (tqpair->mr_free_head == UINT32_MAX) {
+		for (i = 0; i < tqpair->mr_cache_cap; i++) {
+			e = &tqpair->mr_cache[i];
+			if (e->mr != NULL && e->refcnt == 0) {
+				break;
+			}
 		}
-		memmove(&tqpair->mr_cache[0], &tqpair->mr_cache[1],
-			(NVME_OFI_MR_CACHE_N - 1) * sizeof(tqpair->mr_cache[0]));
-		tqpair->mr_cache_n--;
+		if (i < tqpair->mr_cache_cap) {
+			fi_close(&e->mr->fid);
+			e->mr = NULL;
+			e->next_free = tqpair->mr_free_head;
+			tqpair->mr_free_head = i;
+			tqpair->mr_evict++;
+		} else {
+			/* Every entry is in flight — grow the pool (rare; bounded by QD). */
+			uint32_t oldcap = tqpair->mr_cache_cap, newcap = oldcap * 2, j;
+			struct nvme_ofi_mr_cache_entry *grown;
+
+			grown = realloc(tqpair->mr_cache, newcap * sizeof(*grown));
+			if (grown == NULL) {
+				SPDK_ERRLOG("ofi host: MR cache grow failed\n");
+				return -FI_ENOMEM;
+			}
+			tqpair->mr_cache = grown;
+			tqpair->mr_cache_cap = newcap;
+			for (j = oldcap; j < newcap; j++) {
+				tqpair->mr_cache[j].mr = NULL;
+				tqpair->mr_cache[j].next_free = (j + 1 < newcap) ? (j + 1) : tqpair->mr_free_head;
+			}
+			tqpair->mr_free_head = oldcap;
+			tqpair->mr_grow++;
+		}
 	}
+
+	/* 3. Pop a free slot, register, fill. */
+	slot = tqpair->mr_free_head;
+	e = &tqpair->mr_cache[slot];
+	tqpair->mr_free_head = e->next_free;
 
 	req_key = prov_key ? 0 : __atomic_fetch_add(&tctrlr->mr_next_key, 1, __ATOMIC_RELAXED);
 	rc = fi_mr_reg(tqpair->domain, buf, len, access, 0, req_key, 0, &mr, NULL);
 	if (rc != 0) {
 		SPDK_ERRLOG("ofi host: fi_mr_reg (remote data): %s\n", fi_strerror(-rc));
+		e->next_free = tqpair->mr_free_head;
+		tqpair->mr_free_head = slot;
 		return rc;
 	}
 	if (tctrlr->info->domain_attr->mr_mode & FI_MR_ENDPOINT) {
@@ -1364,6 +1593,8 @@ nvme_ofi_mr_get(struct nvme_ofi_qpair *tqpair, void *buf, size_t len,
 		if (rc != 0) {
 			SPDK_ERRLOG("ofi host: fi_mr_bind/enable: %s\n", fi_strerror(-rc));
 			fi_close(&mr->fid);
+			e->next_free = tqpair->mr_free_head;
+			tqpair->mr_free_head = slot;
 			return rc;
 		}
 	}
@@ -1371,17 +1602,39 @@ nvme_ofi_mr_get(struct nvme_ofi_qpair *tqpair, void *buf, size_t len,
 	key = fi_mr_key(mr);
 	addr = (tctrlr->info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) ? (uint64_t)buf : 0;
 
-	e = &tqpair->mr_cache[tqpair->mr_cache_n++];
 	e->buf = buf;
 	e->len = len;
 	e->mr = mr;
 	e->addr = addr;
 	e->key = key;
+	e->refcnt = 1;
 	tqpair->mr_reg++;
 
 	*out_addr = addr;
 	*out_key = key;
+	*out_idx = slot;
 	return 0;
+}
+
+/* Undo per-CID state committed in the V2 submit block when the send fails — the core
+ * retries the request (possibly under a different cid), so this cid's MR reference and
+ * bounce must be released. Self-gating: a no-op for V1/CONNECT/no-data (clean slot). */
+static void
+nvme_ofi_submit_rollback(struct nvme_ofi_qpair *tqpair, uint16_t cid)
+{
+	struct nvme_ofi_outstanding *o;
+
+	if (cid >= tqpair->req_table_sz) {
+		return;
+	}
+	o = &tqpair->outstanding[cid];
+	if (o->bounce != NULL) {
+		nvme_ofi_bounce_put(tqpair, o->bounce);
+		o->bounce = NULL;
+	}
+	nvme_ofi_mr_put(tqpair, o->mr_idx);
+	o->mr_idx = UINT32_MAX;
+	o->need_scatter = false;
 }
 
 static int
@@ -1465,17 +1718,41 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	req->cmd.psdt = SPDK_NVME_PSDT_SGL_MPTR_CONTIG;
 
 	if (use_rma) {
-		/* V2: advertise a keyed SGL so the target moves the data via RMA. SGL
-		 * payloads (multi-segment) are not yet supported on the host side. */
+		/* V2: advertise ONE keyed SGL so the target moves the data via RMA.
+		 *   - contiguous payload: zero-copy — register the caller's buffer directly.
+		 *   - multi-segment SGL: gather into a per-qpair bounce buffer (one CPU copy;
+		 *     design §6.3.2 — portable across CXI rma_iov_limit=1 and verbs>1) and
+		 *     register that. Either way a single keyed SGL is advertised. */
+		void *rma_buf = req->payload.contig_or_cb_arg;
+		struct nvme_ofi_bounce *bounce = NULL;
 		uint64_t rma_addr, rma_key;
+		uint32_t mr_idx;
+		bool need_scatter = false;
 		int mrc;
 
 		if (req->payload.reset_sgl_fn != NULL) {
-			return -EINVAL;
+			/* multi-segment: gather SGL → bounce, then register the bounce. */
+			bounce = nvme_ofi_bounce_get(tqpair);
+			if (bounce == NULL) {
+				return -ENOMEM;
+			}
+			if (xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
+				mrc = nvme_ofi_sgl_to_buf(&req->payload, req->payload_offset,
+							  req->payload_size, bounce->buf);
+				if (mrc != 0) {
+					nvme_ofi_bounce_put(tqpair, bounce);
+					return mrc;
+				}
+			}
+			rma_buf = bounce->buf;
+			need_scatter = (xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST);
 		}
-		mrc = nvme_ofi_mr_get(tqpair, req->payload.contig_or_cb_arg,
-				      req->payload_size, &rma_addr, &rma_key);
+		mrc = nvme_ofi_mr_get(tqpair, rma_buf, req->payload_size,
+				      &rma_addr, &rma_key, &mr_idx);
 		if (mrc != 0) {
+			if (bounce != NULL) {
+				nvme_ofi_bounce_put(tqpair, bounce);
+			}
 			return mrc;
 		}
 		req->cmd.dptr.sgl1.keyed.type = SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK;
@@ -1483,6 +1760,13 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 		req->cmd.dptr.sgl1.keyed.length = req->payload_size;
 		req->cmd.dptr.sgl1.keyed.key = rma_key;
 		req->cmd.dptr.sgl1.address = rma_addr;
+
+		/* Commit per-CID state consumed on completion (#3 MR ref; Gap B bounce).
+		 * Rolled back by nvme_ofi_submit_rollback if the send below fails — the core
+		 * then retries the request, possibly under a different cid. */
+		tqpair->outstanding[cid].mr_idx = mr_idx;
+		tqpair->outstanding[cid].bounce = bounce;
+		tqpair->outstanding[cid].need_scatter = need_scatter;
 
 		/* V2 capsule is the bare 64B SQE — no in-capsule data. */
 		memcpy(slot->buf, &req->cmd, sizeof(req->cmd));
@@ -1544,10 +1828,12 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 			nvme_ofi_drain_cq(tqpair, tqpair->num_slots);
 		} while (++spins < NVME_OFI_SEND_SPIN_MAX);
 		if (rc == -FI_EAGAIN) {
+			nvme_ofi_submit_rollback(tqpair, cid);
 			return -EAGAIN;
 		}
 		if (rc != 0) {
 			SPDK_ERRLOG("ofi host: fi_injectdata: %s\n", fi_strerror(-(int)rc));
+			nvme_ofi_submit_rollback(tqpair, cid);
 			return (int)rc;
 		}
 		/* inject completes inline: no slot held, no tx completion to recycle. The
@@ -1575,10 +1861,12 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 		} while (++spins < NVME_OFI_SEND_SPIN_MAX);
 	}
 	if (rc == -FI_EAGAIN) {
+		nvme_ofi_submit_rollback(tqpair, cid);
 		return -EAGAIN;
 	}
 	if (rc != 0) {
 		SPDK_ERRLOG("ofi host: fi_sendmsg: %s\n", fi_strerror(-(int)rc));
+		nvme_ofi_submit_rollback(tqpair, cid);
 		return (int)rc;
 	}
 
