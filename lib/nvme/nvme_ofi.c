@@ -389,7 +389,10 @@ nvme_ofi_getinfo(const char *prov, struct fi_info **out_info)
 	hints->rx_attr->op_flags = FI_COMPLETION;
 
 	if (strcmp(prov, "cxi") == 0) {
-		hints->caps = FI_MSG | FI_RMA | FI_REMOTE_CQ_DATA | FI_READ | FI_WRITE;
+		/* CXI does NOT advertise FI_REMOTE_CQ_DATA; tx offers no msg_order (fi_info -p cxi -v). */
+		hints->caps = FI_MSG | FI_RMA | FI_READ | FI_WRITE;
+		hints->tx_attr->msg_order = 0;	/* cxi tx offers no ordering; override SAS */
+		hints->rx_attr->msg_order = 0;	/* do not rely on ordering on CXI (design P1-11) */
 		hints->addr_format = FI_ADDR_CXI;
 		hints->domain_attr->mr_mode = FI_MR_PROV_KEY | FI_MR_ALLOCATED | FI_MR_ENDPOINT;
 	} else {

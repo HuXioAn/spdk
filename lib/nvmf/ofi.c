@@ -242,6 +242,15 @@ struct spdk_nvmf_ofi_transport {
 
 	char					provider[32];	/* libfabric provider name */
 
+	/* #46 CQE-fold (fold the response CQE into the C2H fi_write as CQ immediate
+	 * data) needs FI_REMOTE_CQ_DATA on an RMA write. cxi does NOT support that
+	 * (fi_writemsg+CQ_DATA -> "Flags not supported"; verified LUMI 2026-07-17),
+	 * though it DOES deliver CQ data on a fi_sendmsg (cq_data_size=8). So on cxi
+	 * we use the split path (fi_write data, then a separate fi_sendmsg CQE); on
+	 * every other provider (verbs/tcp proven) keep the fold. See req_complete /
+	 * rma_done. */
+	bool					use_cqe_fold;
+
 	/* TCP sideband listeners (one per add_listener). */
 	TAILQ_HEAD(, spdk_nvmf_ofi_listener)	listeners;
 	pthread_mutex_t				lock;
@@ -372,10 +381,17 @@ nvmf_ofi_getinfo(const char *prov, struct fi_info **out_info)
 	hints->rx_attr->op_flags = FI_COMPLETION;
 
 	if (strcmp(prov, "cxi") == 0) {
-		/* CXI reports CQ_DATA in its caps; request it explicitly there. */
-		hints->caps = FI_MSG | FI_RMA | FI_REMOTE_CQ_DATA | FI_READ | FI_WRITE;
+		/* CXI (libfabric 1.22, per `fi_info -p cxi -v` on LUMI) offers FI_MSG/RMA/READ/WRITE
+		 * but does NOT advertise FI_REMOTE_CQ_DATA, and its tx_attr offers NO msg_order
+		 * (rx does offer SAS). Requesting either filters cxi out of fi_getinfo
+		 * (-FI_ENODATA, LUMI bring-up 2026-07-16). We request only what cxi offers; we do
+		 * not rely on cross-message ordering (design P1-11). The V2 CQE-fold path that used
+		 * FI_REMOTE_CQ_DATA as an *op flag* is re-evaluated separately for CXI. */
+		hints->caps = FI_MSG | FI_RMA | FI_READ | FI_WRITE;
 		hints->addr_format = FI_ADDR_CXI;
 		hints->domain_attr->mr_mode = FI_MR_PROV_KEY | FI_MR_ALLOCATED | FI_MR_ENDPOINT;
+		hints->tx_attr->msg_order = 0;	/* cxi tx offers no ordering; override SAS set above */
+		hints->rx_attr->msg_order = 0;	/* don't rely on ordering on CXI (design P1-11) */
 	} else {
 		/* sockets / tcp / verbs;ofi_rxm (prototype P0a/P0b-proven):
 		 *  - FI_READ|FI_WRITE required so ofi_rxm isn't filtered out
@@ -495,6 +511,9 @@ nvmf_ofi_create(struct spdk_nvmf_transport_opts *opts)
 		SPDK_ERRLOG("OFI transport create: getinfo failed for provider '%s'\n", otransport->provider);
 		goto err_info;
 	}
+
+	/* #46 fold is available everywhere except cxi (no RMA+CQ data on cxi). */
+	otransport->use_cqe_fold = (strcmp(otransport->provider, "cxi") != 0);
 
 	rc = fi_fabric(otransport->info->fabric_attr, &otransport->fabric, NULL);
 	if (rc != 0) {
@@ -1563,12 +1582,18 @@ nvmf_ofi_rma_done(struct spdk_nvmf_ofi_req *oreq)
 	if (oreq->rma_is_read) {
 		spdk_nvmf_request_exec(&oreq->req);
 	} else {
-		/* C2H write done. #46: the CQE was folded into the write as CQ
-		 * immediate data, so it is already delivered to the host — no separate
-		 * CQE to send. (This is the only C2H-write path now; the separate-CQE
-		 * fallback posts a fi_sendmsg, not an RMA write, and completes via the
-		 * FI_SEND path.) Recycle the req. */
-		nvmf_ofi_req_release(oreq);
+		/* C2H write done. */
+		if (oreq->rma_with_cqe) {
+			/* #46 fold: the CQE was folded into this write as CQ immediate data,
+			 * so it is already delivered to the host — no separate CQE to send.
+			 * Recycle the req. */
+			nvmf_ofi_req_release(oreq);
+		} else {
+			/* Split path (cxi): the data write completed; now send the CQE (the
+			 * CQE was built into send_buf in req_complete). Completes + recycles
+			 * via the FI_SEND completion path. */
+			nvmf_ofi_send_cqe(oreq, sizeof(struct spdk_nvme_cpl));
+		}
 	}
 }
 
@@ -2262,11 +2287,19 @@ nvmf_ofi_req_complete(struct spdk_nvmf_request *req)
 		if (spdk_nvme_cpl_is_success(rsp) &&
 		    req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST && req->length > 0 &&
 		    req->iovcnt > 0) {
-			/* Push the read result AND deliver the CQE in one operation (#46): a
-			 * fi_writemsg carrying the CID as CQ immediate data. The host
-			 * completes on the write; no separate CQE MSG. On failure, fall
-			 * through to the separate-CQE path below. */
-			if (nvmf_ofi_post_rma_cqe(oreq->oqpair, oreq) == 0) {
+			if (oreq->oqpair->transport->use_cqe_fold) {
+				/* #46 fold: one fi_writemsg carries the read data AND the CQE
+				 * (CID as CQ immediate data). The host completes on the write;
+				 * no separate CQE MSG. */
+				if (nvmf_ofi_post_rma_cqe(oreq->oqpair, oreq) == 0) {
+					return;
+				}
+				/* fold failed hard (-FI_EAGAIN is queued inside) -> split path */
+			}
+			/* Split path (cxi, or fold fallback): fi_write the data now; the CQE
+			 * is sent from rma_done() when this write completes. rma_with_cqe
+			 * stays false so rma_done sends the CQE. */
+			if (nvmf_ofi_post_rma(oreq->oqpair, oreq, false /*is_read = C2H write*/) == 0) {
 				return;
 			}
 		}
