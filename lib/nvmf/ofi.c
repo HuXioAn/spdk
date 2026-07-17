@@ -122,6 +122,16 @@ enum spdk_nvmf_ofi_msg_type {
  * WRITE data into / fi_write's host READ data from. Bounds a single IO's transfer
  * (design max 128 KiB). Host advertises a keyed SGL; target RMAs into this buffer. */
 #define NVMF_OFI_RMA_DATA_SIZE		131072
+
+/* Private extension appended to a CXI V2 SQE.  NVMe's keyed SGL key is only
+ * 32 bits, but CXI provider keys are 64-bit; the extension carries the high
+ * half without changing the standard descriptor layout. */
+#define NVMF_OFI_RMA_KEY_EXT_MAGIC	0x4b49464fu
+struct nvmf_ofi_rma_key_ext {
+	uint32_t magic_le;
+	uint32_t key_hi_le;
+} __attribute__((packed));
+SPDK_STATIC_ASSERT(sizeof(struct nvmf_ofi_rma_key_ext) == 8, "RMA key extension size");
 /* Recv buffer: 64B SQE + in-capsule data. Send buffer: 16B CQE + in-capsule data. */
 #define NVMF_OFI_RECV_BUF_SIZE	(sizeof(struct spdk_nvme_cmd) + NVMF_OFI_IN_CAPSULE_DATA_SIZE)
 #define NVMF_OFI_SEND_BUF_SIZE	(sizeof(struct spdk_nvme_cpl) + NVMF_OFI_IN_CAPSULE_DATA_SIZE)
@@ -2059,6 +2069,26 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 				struct spdk_nvme_sgl_descriptor *sgl =
 					&req->req.cmd->nvme_cmd.dptr.sgl1;
 				uint32_t rlen = sgl->keyed.length;
+				uint64_t rkey = sgl->keyed.key;
+
+				if (strcmp(oqpair->transport->provider, "cxi") == 0) {
+					const struct nvmf_ofi_rma_key_ext *ext;
+
+					if (entries[k].len < sizeof(struct spdk_nvme_cmd) + sizeof(*ext)) {
+						SPDK_ERRLOG("ofi target: CXI keyed SGL missing 64-bit key extension (cid=%u)\n",
+							    sqe->cid);
+						nvmf_ofi_req_release(req);
+						continue;
+					}
+					ext = (const struct nvmf_ofi_rma_key_ext *)
+					      ((const uint8_t *)slot->buf + sizeof(struct spdk_nvme_cmd));
+					if (ofi_le32_to_cpu(ext->magic_le) != NVMF_OFI_RMA_KEY_EXT_MAGIC) {
+						SPDK_ERRLOG("ofi target: bad CXI RMA key extension magic (cid=%u)\n", sqe->cid);
+						nvmf_ofi_req_release(req);
+						continue;
+					}
+					rkey |= (uint64_t)ofi_le32_to_cpu(ext->key_hi_le) << 32;
+				}
 
 				if (rlen > NVMF_OFI_RMA_DATA_SIZE) {
 					/* Reject, never clamp: clamping moved only 128 KiB but still
@@ -2081,7 +2111,7 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 				}
 				req->use_rma = true;
 				req->rma_addr = sgl->address;
-				req->rma_key = sgl->keyed.key;
+				req->rma_key = rkey;
 				req->req.iov[0].iov_base = req->data_buf;
 				req->req.iov[0].iov_len = rlen;
 				req->req.length = rlen;

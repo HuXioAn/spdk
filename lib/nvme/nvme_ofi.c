@@ -76,6 +76,16 @@
 /* V2 RMA single-transfer ceiling — MUST match the target's per-req bounce buffer
  * (NVMF_OFI_RMA_DATA_SIZE in lib/nvmf/ofi.c). */
 #define NVME_OFI_RMA_DATA_SIZE		131072
+
+/* NVMe's keyed SGL carries only a 32-bit key, while CXI returns a 64-bit
+ * provider key.  For CXI V2 commands append this private extension after the
+ * 64-byte SQE; keyed.key still carries the low half for normal providers. */
+#define NVME_OFI_RMA_KEY_EXT_MAGIC	0x4b49464fu /* "OFIK" on little-endian hosts */
+struct nvme_ofi_rma_key_ext {
+	uint32_t magic_le;
+	uint32_t key_hi_le;
+} __attribute__((packed));
+SPDK_STATIC_ASSERT(sizeof(struct nvme_ofi_rma_key_ext) == 8, "RMA key extension size");
 /* Max SGL segments the V2 path accepts per command. Multi-segment payloads are gathered
  * into one bounce buffer (one keyed SGL), so this is independent of the provider's
  * iov_limit — set high enough to avoid the core splitting typical IOs. */
@@ -1702,6 +1712,8 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	uint64_t tag;
 	uint32_t send_len;
 	bool has_incap_data = false;	/* V1 H2C in-capsule payload appended after the SQE */
+	bool has_rma_key_ext = false;
+	struct nvme_ofi_rma_key_ext rma_key_ext = {};
 	struct iovec iov;
 	struct fi_msg msg = {0};
 	ssize_t rc;
@@ -1804,6 +1816,14 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 		req->cmd.dptr.sgl1.keyed.length = req->payload_size;
 		req->cmd.dptr.sgl1.keyed.key = rma_key;
 		req->cmd.dptr.sgl1.address = rma_addr;
+		if (strcmp(tqpair->tctrlr->provider, "cxi") == 0) {
+			/* CXI keys observed on LUMI use all 64 bits.  Silently assigning
+			 * one to keyed.key truncates the high half and the peer reports a
+			 * protection error (prov_errno=18) on its first fi_write. */
+			rma_key_ext.magic_le = nvme_ofi_cpu_to_le32(NVME_OFI_RMA_KEY_EXT_MAGIC);
+			rma_key_ext.key_hi_le = nvme_ofi_cpu_to_le32((uint32_t)(rma_key >> 32));
+			has_rma_key_ext = true;
+		}
 
 		/* Commit per-CID state consumed on completion (#3 MR ref; Gap B bounce).
 		 * Rolled back by nvme_ofi_submit_rollback if the send below fails — the core
@@ -1812,8 +1832,9 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 		tqpair->outstanding[cid].bounce = bounce;
 		tqpair->outstanding[cid].need_scatter = need_scatter;
 
-		/* V2 capsule is the bare 64B SQE — no in-capsule data (inject-direct below). */
-		send_len = sizeof(req->cmd);
+		/* CXI appends the private 8-byte key extension; other providers keep the
+		 * bare 64-byte SQE and retain the inject-direct fast path. */
+		send_len = sizeof(req->cmd) + (has_rma_key_ext ? sizeof(rma_key_ext) : 0);
 	} else {
 		/* V1 in-capsule:
 		 *   - HOST_TO_CONTROLLER: data block lives in *this* capsule at offset 0.
@@ -1861,7 +1882,8 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	 * tcp/sockets are lazy-connect: the first send returns -FI_EAGAIN while the
 	 * connection establishes; the provider progresses when its CQ is read, so spin a
 	 * bounded number draining our own CQ between attempts (p0a_findings). */
-	if (!has_incap_data && send_len <= tqpair->tctrlr->info->tx_attr->inject_size) {
+	if (!has_incap_data && !has_rma_key_ext &&
+	    send_len <= tqpair->tctrlr->info->tx_attr->inject_size) {
 		int spins = 0;
 		do {
 			rc = fi_injectdata(tqpair->ep, &req->cmd, send_len, tag,
@@ -1899,7 +1921,9 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	}
 	TAILQ_REMOVE(&tqpair->send_free, slot, link);
 	memcpy(slot->buf, &req->cmd, sizeof(req->cmd));
-	if (has_incap_data) {
+	if (has_rma_key_ext) {
+		memcpy((char *)slot->buf + sizeof(req->cmd), &rma_key_ext, sizeof(rma_key_ext));
+	} else if (has_incap_data) {
 		memcpy((char *)slot->buf + sizeof(req->cmd), req->payload.contig_or_cb_arg,
 		       req->payload_size);
 	}
