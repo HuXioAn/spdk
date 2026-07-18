@@ -1,7 +1,7 @@
 /*   SPDX-License-Identifier: BSD-3-Clause
  *   Copyright (c) 2026 Andong Hu. All rights reserved.
  *
- *   NVMe-oF OFI (libfabric) HOST (initiator) transport — P1c-2.
+ *   NVMe-oF OFI (libfabric) host transport.
  *
  *   Mirrors the SPDK nvme_tcp/nvme_rdma host-transport shape: registers a
  *   spdk_nvme_transport_ops named "OFI", constructs controllers/qpairs, and
@@ -10,13 +10,10 @@
  *   which drives the Fabrics CONNECT (and all subsequent NVMe IO) through
  *   qpair_submit_request / qpair_process_completions.
  *
- *   Data path (design §6, V1 = pure FI_MSG): each NVMe command is a single
- *   libfabric MSG carrying a 64-byte SQE [+ HOST_TO_CONTROLLER in-capsule data
- *   appended]; each completion is a single MSG carrying a 16-byte CQE [+
- *   CONTROLLER_TO_HOST data appended]. The NVMe CID rides the CQ immediate-data
- *   field as a 64-bit tag (cid<<8 | type) via FI_REMOTE_CQ_DATA — no FI_TAGGED.
- *   V1 is single-segment, single-message per IO (CXI iov_limit=1): an IO whose
- *   data exceeds in_capsule_data_size is rejected (use V2 RMA — future).
+ *   V1 carries command data and completions in MSG capsules. V2 advertises a
+ *   registered host buffer in a keyed SGL and lets the target pull WRITE data or
+ *   push READ data with RMA. The NVMe CID rides the CQ immediate-data field as a
+ *   64-bit tag; FI_TAGGED is not used.
  *
  *   The sideband wire format is the frozen design §5.2 layout, duplicated here
  *   (lib/nvme and lib/nvmf are separate libraries; SPDK_STATIC_ASSERT guards
@@ -56,6 +53,7 @@
 #define NVME_OFI_PROVIDER_ENV		"OFI_PROVIDER"
 /* OFI_RMA=0 forces the V1 in-capsule data path; unset/non-zero = V2 target RMA. */
 #define NVME_OFI_RMA_ENV		"OFI_RMA"
+#define NVME_OFI_CXI_MULTI_RECV_ENV	"OFI_CXI_MULTI_RECV"
 #define NVME_OFI_FI_VERSION		FI_VERSION(1, 22)
 
 /* Spin cap for fi_injectdata/fi_sendmsg on -FI_EAGAIN, draining our own CQ
@@ -93,7 +91,9 @@ SPDK_STATIC_ASSERT(sizeof(struct nvme_ofi_rma_key_ext) == 8, "RMA key extension 
 
 /* CQ entries reaped per fi_cq_read call. Batching amortizes the per-completion
  * libfabric call overhead (vs reading one at a time). */
-#define NVME_OFI_CQ_BATCH		16
+#define NVME_OFI_CQ_BATCH_DEFAULT	16
+#define NVME_OFI_CQ_BATCH_MAX		64
+#define NVME_OFI_CQ_BATCH_ENV		"OFI_HOST_CQ_BATCH"
 
 /* Per-qpair recv/send slot counts == submission-queue depth. The host pre-posts
  * `qdepth` recv buffers (one per possible outstanding CID) and has `qdepth`
@@ -271,11 +271,13 @@ struct nvme_ofi_qpair {
 	/* libfabric endpoint + peer (created in connect_qpair). */
 	struct fid_ep			*ep;
 	struct fid_cq			*cq;		/* per-qpair tx+rx CQ */
-	struct fid_domain		*domain;	/* #45: per-qpair. Each qpair runs on its own core; sharing one ctrlr->domain violated FI_THREAD_DOMAIN and serialized ofi_rxm MANUAL progress across cores. */
+	struct fid_domain		*domain;	/* per-qpair to preserve FI_THREAD_DOMAIN ownership */
 	struct fid_av			*av;		/* per-qpair AV on that domain */
 	fi_addr_t			peer_fi_addr;
 	bool				ep_enabled;
 	bool				mr_local;
+	bool				destroying;
+	bool				use_multi_recv;
 
 	/* Sideband socket + handshake state machine. */
 	struct spdk_sock			*sb_sock;
@@ -340,9 +342,9 @@ struct nvme_ofi_ctrlr {
 
 	struct fi_info			*info;
 	struct fid_fabric		*fabric;
-
 	char				provider[32];
 	bool				use_rma;	/* OFI_RMA env: V2 data path (default on) */
+	uint32_t			cq_batch;	/* entries requested per fi_cq_read */
 	/* RMA MR keys are per-DOMAIN (shared by every qpair on this ctrlr), so the
 	 * requested-key counter for non-PROV_KEY providers must live here, not on the
 	 * qpair — else two qpairs both start at 1 and collide (-FI_EKEYREJECTED). */
@@ -402,7 +404,7 @@ nvme_ofi_getinfo(const char *prov, struct fi_info **out_info)
 		/* CXI does NOT advertise FI_REMOTE_CQ_DATA; tx offers no msg_order (fi_info -p cxi -v). */
 		hints->caps = FI_MSG | FI_RMA | FI_READ | FI_WRITE;
 		hints->tx_attr->msg_order = 0;	/* cxi tx offers no ordering; override SAS */
-		hints->rx_attr->msg_order = 0;	/* do not rely on ordering on CXI (design P1-11) */
+		hints->rx_attr->msg_order = 0;	/* do not rely on receive ordering on CXI */
 		hints->addr_format = FI_ADDR_CXI;
 		hints->domain_attr->mr_mode = FI_MR_PROV_KEY | FI_MR_ALLOCATED | FI_MR_ENDPOINT;
 	} else {
@@ -577,20 +579,102 @@ nvme_ofi_sb_rx_consume(struct nvme_ofi_qpair *tqpair, size_t frame_len)
 static void
 nvme_ofi_ep_teardown(struct nvme_ofi_qpair *tqpair)
 {
+	struct fi_cq_data_entry entries[NVME_OFI_CQ_BATCH_MAX];
+	struct fi_cq_err_entry err;
+	uint32_t i, pending, spins = 0;
+	ssize_t rc, k;
+
+	tqpair->destroying = true;
+	/* CXI retains one endpoint reference for every posted receive. fi_close()
+	 * therefore returns -FI_EBUSY unless they are explicitly cancelled and the
+	 * resulting CQ events are consumed while their slot contexts are still live. */
+	if (tqpair->ep != NULL && tqpair->recv_slots != NULL) {
+		for (i = 0; i < tqpair->num_slots; i++) {
+			if (tqpair->recv_slots[i].posted) {
+				rc = fi_cancel(&tqpair->ep->fid, &tqpair->recv_slots[i]);
+				if (rc != 0 && rc != -FI_ENOENT) {
+					SPDK_WARNLOG("ofi host: fi_cancel(recv %u): %s\n",
+						     i, fi_strerror(-(int)rc));
+				}
+			}
+		}
+
+		do {
+			pending = 0;
+			for (i = 0; i < tqpair->num_slots; i++) {
+				pending += tqpair->recv_slots[i].posted ? 1 : 0;
+			}
+			if (pending == 0 || tqpair->cq == NULL) {
+				break;
+			}
+			rc = fi_cq_read(tqpair->cq, entries, NVME_OFI_CQ_BATCH_MAX);
+			if (rc == -FI_EAVAIL) {
+				memset(&err, 0, sizeof(err));
+				if (fi_cq_readerr(tqpair->cq, &err, 0) > 0 &&
+				    (err.flags & FI_RECV) && err.op_context != NULL) {
+					struct nvme_ofi_recv_slot *slot = err.op_context;
+					if (slot->tqpair == tqpair) {
+						slot->posted = false;
+					}
+				}
+				continue;
+			}
+			if (rc == -FI_EAGAIN) {
+				continue;
+			}
+			if (rc < 0) {
+				SPDK_WARNLOG("ofi host: teardown CQ drain: %s\n", fi_strerror(-(int)rc));
+				break;
+			}
+			for (k = 0; k < rc; k++) {
+				if ((entries[k].flags & FI_RECV) && entries[k].op_context != NULL) {
+					struct nvme_ofi_recv_slot *slot = entries[k].op_context;
+					if (slot->tqpair == tqpair) {
+						slot->posted = false;
+					}
+				}
+			}
+		} while (++spins < 100000);
+		if (pending != 0) {
+			SPDK_WARNLOG("ofi host: %u receives still posted at endpoint teardown\n", pending);
+		}
+	}
+
+	/* FI_MR_ENDPOINT makes every enabled data MR hold an endpoint reference on
+	 * CXI. Close those MRs before the endpoint; doing this in free_res after
+	 * fi_close(ep) leaves the provider repeatedly trying to free a busy EP. */
+	if (tqpair->mr_cache != NULL && tqpair->tctrlr != NULL &&
+	    (tqpair->tctrlr->info->domain_attr->mr_mode & FI_MR_ENDPOINT)) {
+		for (i = 0; i < tqpair->mr_cache_cap; i++) {
+			if (tqpair->mr_cache[i].mr != NULL) {
+				rc = fi_close(&tqpair->mr_cache[i].mr->fid);
+				if (rc != 0) {
+					SPDK_WARNLOG("ofi host: fi_close(data MR %u): %s\n",
+						     i, fi_strerror(-(int)rc));
+				} else {
+					tqpair->mr_cache[i].mr = NULL;
+				}
+			}
+		}
+	}
+
 	if (tqpair->peer_fi_addr != FI_ADDR_NOTAVAIL && tqpair->av != NULL) {
 		fi_av_remove(tqpair->av, &tqpair->peer_fi_addr, 1, 0);
 		tqpair->peer_fi_addr = FI_ADDR_NOTAVAIL;
 	}
 	if (tqpair->ep != NULL) {
-		fi_close(&tqpair->ep->fid);
+		rc = fi_close(&tqpair->ep->fid);
+		if (rc != 0) {
+			SPDK_WARNLOG("ofi host: fi_close(endpoint): %s\n", fi_strerror(-(int)rc));
+		}
 		tqpair->ep = NULL;
 	}
 	tqpair->ep_enabled = false;
 }
 
-/* Bring up the per-qpair EP on the ctrlr's domain, P0-1 order (bind CQ before
- * enable; getname after enable). Runs synchronously in connect_qpair (local,
- * fast, on the qpair's thread). Returns 0 / -fi_errno. */
+/* Bring up the per-qpair endpoint on its domain. Bind the address vector and
+ * completion queues before enabling the endpoint, then obtain its address.
+ * Runs synchronously on the qpair's thread and returns 0 or -fi_errno. */
 static int
 nvme_ofi_ep_create(struct nvme_ofi_qpair *tqpair)
 {
@@ -602,6 +686,17 @@ nvme_ofi_ep_create(struct nvme_ofi_qpair *tqpair)
 	if (rc != 0) {
 		SPDK_ERRLOG("ofi host: fi_endpoint: %s\n", fi_strerror(-rc));
 		return rc;
+	}
+	if (tqpair->use_multi_recv) {
+		size_t min_multi_recv = sizeof(struct spdk_nvme_cpl);
+
+		rc = fi_setopt(&tqpair->ep->fid, FI_OPT_ENDPOINT, FI_OPT_MIN_MULTI_RECV,
+			       &min_multi_recv, sizeof(min_multi_recv));
+		if (rc != 0) {
+			SPDK_ERRLOG("ofi host: fi_setopt(FI_OPT_MIN_MULTI_RECV): %s\n",
+				    fi_strerror(-rc));
+			goto err;
+		}
 	}
 	/* Pin the EP's source to the NIC we reached the target on (the sideband
 	 * socket's local IP). fi_getinfo(node=NULL) otherwise lets the tcp/sockets
@@ -668,9 +763,28 @@ nvme_ofi_post_recv(struct nvme_ofi_qpair *tqpair, struct nvme_ofi_recv_slot *slo
 {
 	ssize_t rc;
 
+	if (tqpair->destroying) {
+		return -ECANCELED;
+	}
 	for (;;) {
-		rc = fi_recv(tqpair->ep, slot->buf, NVME_OFI_RECV_BUF_SIZE, slot->desc,
-			     tqpair->peer_fi_addr, slot);
+		if (tqpair->use_multi_recv) {
+			struct iovec iov = {
+				.iov_base = slot->buf,
+				.iov_len = NVME_OFI_RECV_BUF_SIZE,
+			};
+			struct fi_msg msg = {
+				.msg_iov = &iov,
+				.desc = slot->desc != NULL ? &slot->desc : NULL,
+				.iov_count = 1,
+				.addr = tqpair->peer_fi_addr,
+				.context = slot,
+			};
+
+			rc = fi_recvmsg(tqpair->ep, &msg, FI_MULTI_RECV);
+		} else {
+			rc = fi_recv(tqpair->ep, slot->buf, NVME_OFI_RECV_BUF_SIZE, slot->desc,
+				     tqpair->peer_fi_addr, slot);
+		}
 		if (rc == -FI_EAGAIN) {
 			return -EAGAIN;
 		}
@@ -837,6 +951,25 @@ nvme_ofi_complete_request(struct nvme_ofi_qpair *tqpair, uint16_t cid,
 /* ctrlr_construct / destruct / enable                                        */
 /* -------------------------------------------------------------------------- */
 
+static uint32_t
+nvme_ofi_cq_batch_from_env(void)
+{
+	const char *value = getenv(NVME_OFI_CQ_BATCH_ENV);
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (value == NULL || value[0] == '\0') {
+		return NVME_OFI_CQ_BATCH_DEFAULT;
+	}
+	parsed = strtoul(value, &end, 10);
+	if (end == value || *end != '\0' || parsed < 1 || parsed > NVME_OFI_CQ_BATCH_MAX) {
+		SPDK_WARNLOG("ofi host: ignoring invalid %s='%s' (valid 1..%u)\n",
+			     NVME_OFI_CQ_BATCH_ENV, value, NVME_OFI_CQ_BATCH_MAX);
+		return NVME_OFI_CQ_BATCH_DEFAULT;
+	}
+	return (uint32_t)parsed;
+}
+
 static struct spdk_nvme_ctrlr *
 nvme_ofi_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 			 const struct spdk_nvme_ctrlr_opts *opts, void *devhandle)
@@ -865,16 +998,27 @@ nvme_ofi_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 		prov = NVME_OFI_DEFAULT_PROVIDER;
 	}
 	snprintf(tctrlr->provider, sizeof(tctrlr->provider), "%s", prov);
+	tctrlr->cq_batch = nvme_ofi_cq_batch_from_env();
 
 	/* V2 RMA data path on by default; OFI_RMA=0 selects the V1 in-capsule path
 	 * (used for A/B comparison — the target adapts per-command from the SGL type,
 	 * so only the host chooses). */
 	{
 		const char *rma = getenv(NVME_OFI_RMA_ENV);
-		tctrlr->use_rma = (rma == NULL || rma[0] == '\0') ? true : (atoi(rma) != 0);
+		long rma_value = 1;
+
+		if (rma != NULL && rma[0] != '\0') {
+			rma_value = spdk_strtol(rma, 10);
+			if (rma_value < 0) {
+				SPDK_WARNLOG("ofi host: ignoring invalid %s='%s'\n", NVME_OFI_RMA_ENV, rma);
+				rma_value = 1;
+			}
+		}
+		tctrlr->use_rma = rma_value != 0;
 		tctrlr->mr_next_key = 1;	/* domain-wide requested_key allocator (non-PROV_KEY) */
 		SPDK_INFOLOG(nvme_ofi, "ofi host: data path = %s\n",
 			     tctrlr->use_rma ? "V2 (target RMA)" : "V1 (in-capsule)");
+		SPDK_INFOLOG(nvme_ofi, "ofi host: CQ read batch = %u\n", tctrlr->cq_batch);
 	}
 
 	/* Per-ctrlr libfabric: just the info + fabric. The domain + AV are per-QPAIR
@@ -892,7 +1036,6 @@ nvme_ofi_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 		SPDK_ERRLOG("ofi host: fi_fabric: %s\n", fi_strerror(-rc));
 		goto err_fabric;
 	}
-
 	rc = nvme_ctrlr_construct(&tctrlr->ctrlr);
 	if (rc != 0) {
 		goto err_core;
@@ -1031,9 +1174,12 @@ nvme_ofi_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 	tqpair->num_slots = qsize;
 	tqpair->req_table_sz = num_requests;
 	tqpair->use_rma = tctrlr->use_rma;
+	tqpair->use_multi_recv = tqpair->use_rma && strcmp(tctrlr->provider, "cxi") == 0 &&
+				    (getenv(NVME_OFI_CXI_MULTI_RECV_ENV) == NULL ||
+				     strcmp(getenv(NVME_OFI_CXI_MULTI_RECV_ENV), "0") != 0);
 
-	/* #45: per-qpair domain + AV (see ctrlr_construct). Must precede the CQ and
-	 * the EP (which binds both). */
+	/* Each qpair is progressed by one reactor and owns its domain. Sharing the
+	 * CXI domain introduces provider-wide serialization across those reactors. */
 	rc = fi_domain(tctrlr->fabric, tctrlr->info, &tqpair->domain, NULL);
 	if (rc != 0) {
 		SPDK_ERRLOG("ofi host: fi_domain: %s\n", fi_strerror(-rc));
@@ -1233,7 +1379,7 @@ nvme_ofi_drain_pending_recv(struct nvme_ofi_qpair *tqpair)
 static int
 nvme_ofi_drain_cq(struct nvme_ofi_qpair *tqpair, uint32_t max_completions)
 {
-	struct fi_cq_data_entry entries[NVME_OFI_CQ_BATCH];
+	struct fi_cq_data_entry entries[NVME_OFI_CQ_BATCH_MAX];
 	struct fi_cq_err_entry err;
 	uint32_t reaped = 0;
 	ssize_t rc, k;
@@ -1247,7 +1393,7 @@ nvme_ofi_drain_cq(struct nvme_ofi_qpair *tqpair, uint32_t max_completions)
 	}
 
 	while (reaped < max_completions) {
-		uint32_t want = spdk_min(NVME_OFI_CQ_BATCH, max_completions - reaped);
+		uint32_t want = spdk_min(tqpair->tctrlr->cq_batch, max_completions - reaped);
 
 		rc = fi_cq_read(tqpair->cq, entries, want);
 		if (rc == -FI_EAGAIN) {
@@ -1271,23 +1417,36 @@ nvme_ofi_drain_cq(struct nvme_ofi_qpair *tqpair, uint32_t max_completions)
 		for (k = 0; k < rc; k++) {
 			struct fi_cq_data_entry *e = &entries[k];
 
-			if (e->flags & FI_RECV) {
+			if ((e->flags & FI_MULTI_RECV) != 0 && (e->flags & FI_RECV) == 0) {
+				/* Providers may report multi-recv buffer release as a standalone
+				 * completion. It is not a TX completion and carries no CQE. */
+				struct nvme_ofi_recv_slot *slot = e->op_context;
+
+				slot->posted = false;
+				if (nvme_ofi_post_recv(tqpair, slot) != 0) {
+					TAILQ_INSERT_TAIL(&tqpair->pending_recvs, slot, link);
+				}
+			} else if (e->flags & FI_RECV) {
 				struct nvme_ofi_recv_slot *slot = e->op_context;
 				uint16_t cid = NVME_OFI_TAG_CID(e->data);
 				const struct spdk_nvme_cpl *cpl;
 				const void *data = NULL;
+				const void *recv_buf = e->buf != NULL ? e->buf : slot->buf;
 				uint32_t data_len = 0;
 
 				if (e->len >= sizeof(struct spdk_nvme_cpl)) {
-					cpl = (const struct spdk_nvme_cpl *)slot->buf;
+					cpl = (const struct spdk_nvme_cpl *)recv_buf;
 					if (e->len > sizeof(struct spdk_nvme_cpl)) {
-						data = (const char *)slot->buf + sizeof(struct spdk_nvme_cpl);
+						data = (const char *)recv_buf + sizeof(struct spdk_nvme_cpl);
 						data_len = e->len - sizeof(struct spdk_nvme_cpl);
 					}
 					nvme_ofi_complete_request(tqpair, cid, cpl, data, data_len);
 				}
-				slot->posted = false;
-				if (nvme_ofi_post_recv(tqpair, slot) != 0) {
+				if (!tqpair->use_multi_recv || (e->flags & FI_MULTI_RECV) != 0) {
+					slot->posted = false;
+				}
+				if ((!tqpair->use_multi_recv || (e->flags & FI_MULTI_RECV) != 0) &&
+				    nvme_ofi_post_recv(tqpair, slot) != 0) {
 					/* Provider recv resources exhausted (-FI_EAGAIN). Queue instead
 					 * of dropping — a dropped slot permanently shrinks the recv pool
 					 * and starves the qpair. Retried at the top of the next drain_cq. */
@@ -1359,12 +1518,17 @@ nvme_ofi_connect_poll(struct nvme_ofi_qpair *tqpair)
 		case NVME_OFI_SB_EP_CREATE: {
 			uint8_t abuf[sizeof(struct nvme_ofi_sb_addr) + 256];
 			struct nvme_ofi_sb_addr *ah = (struct nvme_ofi_sb_addr *)abuf;
+			uint32_t flags = 0;
 
 			rc = nvme_ofi_ep_create(tqpair);
 			if (rc != 0) { goto fail; }
 			memset(ah, 0, sizeof(*ah));
 			snprintf(ah->provider, sizeof(ah->provider), "%s", tqpair->tctrlr->provider);
 			ah->ep_addr_len_le = nvme_ofi_cpu_to_le32((uint32_t)tqpair->local_ep_addr_len);
+			if (tqpair->tctrlr->use_rma) {
+				flags |= NVME_OFI_SB_ADDR_FLAG_RMA;
+			}
+			ah->flags_le = nvme_ofi_cpu_to_le32(flags);
 			memcpy(abuf + sizeof(*ah), tqpair->local_ep_addr, tqpair->local_ep_addr_len);
 			nvme_ofi_sb_queue(tqpair, NVME_OFI_SB_ADDR_EXCH, abuf,
 					  sizeof(*ah) + (uint32_t)tqpair->local_ep_addr_len,
@@ -1503,6 +1667,7 @@ nvme_ofi_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpa
 	struct nvme_ofi_qpair *tqpair = nvme_ofi_qpair(qpair);
 	const struct spdk_nvme_transport_id *trid = &ctrlr->trid;
 	struct nvme_ofi_sb_hello hello;
+	long port;
 
 	if (tqpair->sb_state == NVME_OFI_SB_FAILED) {
 		return -EIO;
@@ -1511,7 +1676,12 @@ nvme_ofi_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpa
 		return 0;	/* already initiating (e.g. reconnect) */
 	}
 
-	tqpair->sb_sock = spdk_sock_connect(trid->traddr, atoi(trid->trsvcid), NULL);
+	port = spdk_strtol(trid->trsvcid, 10);
+	if (port <= 0 || port > UINT16_MAX) {
+		SPDK_ERRLOG("ofi host: invalid sideband service '%s'\n", trid->trsvcid);
+		return -EINVAL;
+	}
+	tqpair->sb_sock = spdk_sock_connect(trid->traddr, (int)port, NULL);
 	if (tqpair->sb_sock == NULL) {
 		SPDK_ERRLOG("ofi host: sb connect failed: %s\n", spdk_strerror(errno));
 		return -errno;
@@ -2187,7 +2357,7 @@ const struct spdk_nvme_transport_ops nvme_ofi_ops = {
 SPDK_NVME_TRANSPORT_REGISTER(ofi, &nvme_ofi_ops);
 SPDK_LOG_REGISTER_COMPONENT(nvme_ofi)
 
-/* Host (initiator) tracepoints — Phase 2 of P1g observability. Separate group
+/* Host (initiator) tracepoints. Use a separate group
  * 0x13 / owner 0x32 / object 0x70 from the target (lib/nvmf, group 0x7): nvmf_tgt
  * links both lib/nvmf and lib/nvme, so the IDs must not collide. Mirrors nvme_tcp.c
  * (owner_type + object registered globally; per-event owner_id = qpair->id, no

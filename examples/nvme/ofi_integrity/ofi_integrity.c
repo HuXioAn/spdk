@@ -2,7 +2,7 @@
  *   Copyright (C) 2026.  OFI transport data-integrity initiator.
  *
  * Why this exists: spdk_nvme_perf proves the OFI transport runs at line rate
- * with zero errors, but it never *verifies payload contents*. The P1h host-side
+ * with zero errors, but it never *verifies payload contents*. The host-side
  * work (lib/nvme/nvme_ofi.c) added a multi-segment gather/scatter bounce path
  * (SGL payload -> one contiguous bounce -> one keyed SGL -> target RMA; scatter
  * back on read) plus a refcounted MR cache. Those were validated for throughput
@@ -30,6 +30,7 @@ static struct spdk_nvme_ns	*g_ns;
 static struct spdk_nvme_qpair	*g_qpair;
 static uint32_t			 g_sector;
 static int			 g_fail;	/* total mismatched cases */
+static bool			 g_contig_only;
 
 /* Position-dependent byte pattern: a function of the byte's GLOBAL logical
  * offset within the IO payload, so a swapped segment or a shifted scatter
@@ -116,6 +117,66 @@ wait_io(struct io_ctx *s, const char *what)
 		}
 	}
 	return s->error ? -1 : 0;
+}
+
+/*
+ * One contiguous round trip. Unlike run_case(), this uses the ordinary
+ * read/write commands and therefore exercises both the V1 in-capsule path and
+ * the V2 direct-MR path. Keep this case even when the multi-segment sweep is
+ * disabled so hardware bring-up always includes a stateful byte comparison.
+ */
+static int
+run_contig_case(const char *label, uint32_t size, uint64_t lba_base, uint32_t seed)
+{
+	struct io_ctx wctx = {}, rctx = {};
+	uint8_t *wbuf = NULL, *rbuf = NULL;
+	uint32_t lba_count = size / g_sector;
+	uint32_t i;
+	int rc = 1;
+
+	printf("[case %-14s] contiguous size=%-7u lba=%lu+%u seed=0x%x ... ",
+	       label, size, (unsigned long)lba_base, lba_count, seed);
+	fflush(stdout);
+
+	wbuf = spdk_zmalloc(size, 0x1000, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
+	rbuf = spdk_zmalloc(size, 0x1000, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
+	if (wbuf == NULL || rbuf == NULL) {
+		printf("FAIL (alloc)\n");
+		goto out;
+	}
+	for (i = 0; i < size; i++) {
+		wbuf[i] = pat(i, seed);
+	}
+
+	if (spdk_nvme_ns_cmd_write(g_ns, g_qpair, wbuf, lba_base, lba_count,
+				   io_complete, &wctx, 0) != 0 || wait_io(&wctx, "write")) {
+		printf("FAIL (write)\n");
+		goto out;
+	}
+	if (spdk_nvme_ns_cmd_read(g_ns, g_qpair, rbuf, lba_base, lba_count,
+				  io_complete, &rctx, 0) != 0 || wait_io(&rctx, "read")) {
+		printf("FAIL (read)\n");
+		goto out;
+	}
+	for (i = 0; i < size; i++) {
+		uint8_t want = pat(i, seed);
+
+		if (rbuf[i] != want) {
+			printf("FAIL: mismatch off=%u got=0x%02x want=0x%02x\n",
+			       i, rbuf[i], want);
+			goto out;
+		}
+	}
+	printf("OK\n");
+	rc = 0;
+
+out:
+	spdk_free(wbuf);
+	spdk_free(rbuf);
+	if (rc != 0) {
+		g_fail++;
+	}
+	return rc;
 }
 
 /*
@@ -264,7 +325,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 	spdk_nvme_trid_populate_transport(&g_trid, SPDK_NVME_TRANSPORT_PCIE);
 	snprintf(g_trid.subnqn, sizeof(g_trid.subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
 
-	while ((op = getopt(argc, argv, "i:r:L:")) != -1) {
+	while ((op = getopt(argc, argv, "i:r:L:nC")) != -1) {
 		switch (op) {
 		case 'i':
 			env_opts->shm_id = spdk_strtol(optarg, 10);
@@ -278,8 +339,19 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		case 'L':
 			spdk_log_set_flag(optarg);
 			break;
+		case 'n':
+			env_opts->no_huge = true;
+			env_opts->mem_size = 1024;
+			break;
+		case 'C':
+			g_contig_only = true;
+			break;
 		default:
-			fprintf(stderr, "usage: %s -r <trid> [-i shmid] [-L flag]\n", argv[0]);
+			fprintf(stderr,
+				"usage: %s -r <trid> [-i shmid] [-L flag] [-n] [-C]\n"
+				"  -n  use DPDK no-huge mode\n"
+				"  -C  run only the contiguous 4 KiB case (for V1)\n",
+				argv[0]);
 			return 1;
 		}
 	}
@@ -327,6 +399,14 @@ main(int argc, char **argv)
 	}
 	printf("Namespace sector=%u bytes, max_xfer=%u\n", g_sector,
 	       spdk_nvme_ns_get_max_io_xfer_size(g_ns));
+	printf("--- OFI contiguous data-integrity check ---\n");
+	run_contig_case("contig-4k", 4096, lba, 0x01);
+	lba += 8;
+
+	if (g_contig_only) {
+		goto done;
+	}
+
 	printf("--- OFI multi-segment data-integrity sweep ---\n");
 
 	/* 1-seg SGL: exercises the bounce path at its minimum (still reset_sgl_fn
@@ -341,6 +421,7 @@ main(int argc, char **argv)
 	/* Uneven segment count / odd size to stress the iterator math. */
 	run_case("sgl-3x8k",   3,  8192, lba, 0x66);  lba += 48;
 
+done:
 	printf("--- result: %s (%d failing case%s) ---\n",
 	       g_fail == 0 ? "ALL PASS" : "FAILURES", g_fail, g_fail == 1 ? "" : "s");
 	rc = g_fail ? 1 : 0;
