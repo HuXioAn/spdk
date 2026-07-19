@@ -54,6 +54,8 @@
 /* OFI_RMA=0 forces the V1 in-capsule data path; unset/non-zero = V2 target RMA. */
 #define NVME_OFI_RMA_ENV		"OFI_RMA"
 #define NVME_OFI_CXI_MULTI_RECV_ENV	"OFI_CXI_MULTI_RECV"
+#define NVME_OFI_INLINE_THRESHOLD_ENV	"OFI_INLINE_THRESHOLD"
+#define NVME_OFI_INLINE_QPAIR_LIMIT_ENV	"OFI_INLINE_QPAIR_LIMIT"
 #define NVME_OFI_FI_VERSION		FI_VERSION(1, 22)
 
 /* Spin cap for fi_injectdata/fi_sendmsg on -FI_EAGAIN, draining our own CQ
@@ -70,6 +72,8 @@
  * RMA handles large IO). Sized to hold a Fabrics CONNECT data struct and an
  * Identify response, the largest admin payloads. */
 #define NVME_OFI_IN_CAPSULE_DATA_SIZE	4096
+#define NVME_OFI_CXI_INLINE_THRESHOLD_DEFAULT	4096
+#define NVME_OFI_INLINE_QPAIR_LIMIT_DEFAULT	4
 
 /* V2 RMA single-transfer ceiling — MUST match the target's per-req bounce buffer
  * (NVMF_OFI_RMA_DATA_SIZE in lib/nvmf/ofi.c). */
@@ -100,6 +104,7 @@ SPDK_STATIC_ASSERT(sizeof(struct nvme_ofi_rma_key_ext) == 8, "RMA key extension 
  * send slots. */
 #define NVME_OFI_SEND_BUF_SIZE		(sizeof(struct spdk_nvme_cmd) + NVME_OFI_IN_CAPSULE_DATA_SIZE)
 #define NVME_OFI_RECV_BUF_SIZE		(sizeof(struct spdk_nvme_cpl) + NVME_OFI_IN_CAPSULE_DATA_SIZE)
+#define NVME_OFI_MULTI_RECV_BUF_SIZE	(64 * 1024)
 
 /* Sideband framing scratch: largest handshake frame is hdr + ADDR_EXCHANGE. */
 #define NVME_OFI_SB_BUF_SIZE		(sizeof(struct nvme_ofi_sb_hdr) + NVME_OFI_SB_MAX_ADDR_PAYLOAD)
@@ -209,7 +214,7 @@ enum nvme_ofi_sb_state {
  * entry maps back to the buffer (and the qpair via tqpair). */
 struct nvme_ofi_recv_slot {
 	struct nvme_ofi_qpair	*tqpair;
-	void			*buf;		/* NVME_OFI_RECV_BUF_SIZE */
+	void			*buf;		/* one response, or a 64 KiB multi-recv slab */
 	void			*desc;		/* MR desc (FI_MR_LOCAL) or NULL */
 	struct fid_mr		*mr;		/* MR handle when mr_local */
 	bool			posted;
@@ -329,6 +334,10 @@ struct nvme_ofi_qpair {
 	uint64_t			mr_hit;		/* stat: cache hits */
 	uint64_t			mr_evict;	/* stat: cold entries reclaimed */
 	uint64_t			mr_grow;	/* stat: pool grew (all entries in-flight) */
+	uint64_t			inline_h2c;	/* V2-capable qpair: small WRITE sent in-capsule */
+	uint64_t			inline_c2h;	/* V2-capable qpair: small READ returned in response */
+	uint64_t			rma_submits;	/* requests that advertised a keyed SGL */
+	uint32_t			active_reqs;	/* submitted requests awaiting a response */
 
 	/* Gap B: multi-segment bounce-buffer free-list (lazy, bounded by QD in-flight). */
 	struct nvme_ofi_bounce		*bounce_free;
@@ -344,6 +353,9 @@ struct nvme_ofi_ctrlr {
 	struct fid_fabric		*fabric;
 	char				provider[32];
 	bool				use_rma;	/* OFI_RMA env: V2 data path (default on) */
+	uint32_t			inline_threshold; /* V2 per-request in-capsule cutoff */
+	uint32_t			inline_qpair_limit; /* 0 = unlimited; otherwise bounds shallow eager qpairs */
+	uint32_t			io_qpair_count; /* atomically read by per-qpair submission threads */
 	uint32_t			cq_batch;	/* entries requested per fi_cq_read */
 	/* RMA MR keys are per-DOMAIN (shared by every qpair on this ctrlr), so the
 	 * requested-key counter for non-PROV_KEY providers must live here, not on the
@@ -688,7 +700,10 @@ nvme_ofi_ep_create(struct nvme_ofi_qpair *tqpair)
 		return rc;
 	}
 	if (tqpair->use_multi_recv) {
-		size_t min_multi_recv = sizeof(struct spdk_nvme_cpl);
+		/* CXI may already have the next match in flight when it auto-unlinks a
+		 * multi-recv slab. Reserve two maximum-size responses so that operation
+		 * cannot land in a one-message tail and truncate. */
+		size_t min_multi_recv = 2 * NVME_OFI_RECV_BUF_SIZE;
 
 		rc = fi_setopt(&tqpair->ep->fid, FI_OPT_ENDPOINT, FI_OPT_MIN_MULTI_RECV,
 			       &min_multi_recv, sizeof(min_multi_recv));
@@ -754,13 +769,15 @@ err:
 }
 
 /* -------------------------------------------------------------------------- */
-/* V1 data-path send / recv                                                   */
+/* Message data-path send / recv                                              */
 /* -------------------------------------------------------------------------- */
 
 /* Pre-post (or re-post) a recv slot. Returns 0 / -fi_errno. */
 static int
 nvme_ofi_post_recv(struct nvme_ofi_qpair *tqpair, struct nvme_ofi_recv_slot *slot)
 {
+	size_t recv_buf_size = tqpair->use_multi_recv ?
+			       NVME_OFI_MULTI_RECV_BUF_SIZE : NVME_OFI_RECV_BUF_SIZE;
 	ssize_t rc;
 
 	if (tqpair->destroying) {
@@ -770,7 +787,7 @@ nvme_ofi_post_recv(struct nvme_ofi_qpair *tqpair, struct nvme_ofi_recv_slot *slo
 		if (tqpair->use_multi_recv) {
 			struct iovec iov = {
 				.iov_base = slot->buf,
-				.iov_len = NVME_OFI_RECV_BUF_SIZE,
+				.iov_len = recv_buf_size,
 			};
 			struct fi_msg msg = {
 				.msg_iov = &iov,
@@ -782,7 +799,7 @@ nvme_ofi_post_recv(struct nvme_ofi_qpair *tqpair, struct nvme_ofi_recv_slot *slo
 
 			rc = fi_recvmsg(tqpair->ep, &msg, FI_MULTI_RECV);
 		} else {
-			rc = fi_recv(tqpair->ep, slot->buf, NVME_OFI_RECV_BUF_SIZE, slot->desc,
+			rc = fi_recv(tqpair->ep, slot->buf, recv_buf_size, slot->desc,
 				     tqpair->peer_fi_addr, slot);
 		}
 		if (rc == -FI_EAGAIN) {
@@ -913,6 +930,8 @@ nvme_ofi_complete_request(struct nvme_ofi_qpair *tqpair, uint16_t cid,
 	req = tqpair->req_table[cid];
 	o = &tqpair->outstanding[cid];
 	tqpair->req_table[cid] = NULL;
+	assert(tqpair->active_reqs > 0);
+	tqpair->active_reqs--;
 	nvme_ofi_cid_put(tqpair, cid);	/* H2: cid is now free (response consumed) */
 
 	/* Gap B: a multi-seg READ landed its data in a bounce buffer — scatter it back into
@@ -935,7 +954,7 @@ nvme_ofi_complete_request(struct nvme_ofi_qpair *tqpair, uint16_t cid,
 	if (data != NULL && data_len > 0 &&
 	    spdk_nvme_opc_get_data_transfer(req->cmd.opc) == SPDK_NVME_DATA_CONTROLLER_TO_HOST &&
 	    req->payload.reset_sgl_fn == NULL) {
-		memcpy(req->payload.contig_or_cb_arg, data,
+		memcpy((char *)req->payload.contig_or_cb_arg + req->payload_offset, data,
 		       spdk_min(data_len, req->payload_size));
 	}
 
@@ -970,6 +989,25 @@ nvme_ofi_cq_batch_from_env(void)
 	return (uint32_t)parsed;
 }
 
+static uint32_t
+nvme_ofi_u32_from_env(const char *name, uint32_t default_value, uint32_t max_value)
+{
+	const char *value = getenv(name);
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (value == NULL || value[0] == '\0') {
+		return default_value;
+	}
+	parsed = strtoul(value, &end, 10);
+	if (end == value || *end != '\0' || parsed > max_value) {
+		SPDK_WARNLOG("ofi host: ignoring invalid %s='%s' (valid 0..%u)\n",
+			     name, value, max_value);
+		return default_value;
+	}
+	return (uint32_t)parsed;
+}
+
 static struct spdk_nvme_ctrlr *
 nvme_ofi_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 			 const struct spdk_nvme_ctrlr_opts *opts, void *devhandle)
@@ -999,6 +1037,13 @@ nvme_ofi_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 	}
 	snprintf(tctrlr->provider, sizeof(tctrlr->provider), "%s", prov);
 	tctrlr->cq_batch = nvme_ofi_cq_batch_from_env();
+	tctrlr->inline_threshold = nvme_ofi_u32_from_env(NVME_OFI_INLINE_THRESHOLD_ENV,
+					  strcmp(prov, "cxi") == 0 ?
+					  NVME_OFI_CXI_INLINE_THRESHOLD_DEFAULT : 0,
+					  NVME_OFI_IN_CAPSULE_DATA_SIZE);
+	tctrlr->inline_qpair_limit = nvme_ofi_u32_from_env(NVME_OFI_INLINE_QPAIR_LIMIT_ENV,
+					    NVME_OFI_INLINE_QPAIR_LIMIT_DEFAULT,
+					    UINT16_MAX);
 
 	/* V2 RMA data path on by default; OFI_RMA=0 selects the V1 in-capsule path
 	 * (used for A/B comparison — the target adapts per-command from the SGL type,
@@ -1019,6 +1064,8 @@ nvme_ofi_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 		SPDK_INFOLOG(nvme_ofi, "ofi host: data path = %s\n",
 			     tctrlr->use_rma ? "V2 (target RMA)" : "V1 (in-capsule)");
 		SPDK_INFOLOG(nvme_ofi, "ofi host: CQ read batch = %u\n", tctrlr->cq_batch);
+		SPDK_INFOLOG(nvme_ofi, "ofi host: V2 inline threshold = %u bytes, qpair limit = %u\n",
+			     tctrlr->inline_threshold, tctrlr->inline_qpair_limit);
 	}
 
 	/* Per-ctrlr libfabric: just the info + fabric. The domain + AV are per-QPAIR
@@ -1055,7 +1102,9 @@ nvme_ofi_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 		return NULL;
 	}
 
-	SPDK_NOTICELOG("*** OFI host ctrlr constructed (provider=%s) ***\n", tctrlr->provider);
+	SPDK_NOTICELOG("OFI host controller constructed: provider=%s inline_threshold=%u "
+		       "inline_qpair_limit=%u\n", tctrlr->provider, tctrlr->inline_threshold,
+		       tctrlr->inline_qpair_limit);
 	return &tctrlr->ctrlr;
 
 err_core:
@@ -1139,6 +1188,7 @@ nvme_ofi_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 	struct nvme_ofi_qpair *tqpair;
 	enum spdk_nvme_qprio qprio = SPDK_NVME_QPRIO_URGENT;
 	uint32_t qsize, num_requests;
+	size_t recv_buf_size;
 	bool async = true;
 	struct fi_cq_attr cq_attr = {0};
 	uint32_t i;
@@ -1177,6 +1227,8 @@ nvme_ofi_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 	tqpair->use_multi_recv = tqpair->use_rma && strcmp(tctrlr->provider, "cxi") == 0 &&
 				    (getenv(NVME_OFI_CXI_MULTI_RECV_ENV) == NULL ||
 				     strcmp(getenv(NVME_OFI_CXI_MULTI_RECV_ENV), "0") != 0);
+	recv_buf_size = tqpair->use_multi_recv ?
+			NVME_OFI_MULTI_RECV_BUF_SIZE : NVME_OFI_RECV_BUF_SIZE;
 
 	/* Each qpair is progressed by one reactor and owns its domain. Sharing the
 	 * CXI domain introduces provider-wide serialization across those reactors. */
@@ -1236,7 +1288,7 @@ nvme_ofi_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 	}
 	for (i = 0; i < qsize; i++) {
 		tqpair->recv_slots[i].tqpair = tqpair;
-		tqpair->recv_slots[i].buf = spdk_zmalloc(NVME_OFI_RECV_BUF_SIZE, 0, NULL,
+		tqpair->recv_slots[i].buf = spdk_zmalloc(recv_buf_size, 0, NULL,
 					  SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 		tqpair->send_slots[i].tqpair = tqpair;
 		tqpair->send_slots[i].buf = spdk_zmalloc(NVME_OFI_SEND_BUF_SIZE, 0, NULL,
@@ -1247,7 +1299,7 @@ nvme_ofi_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 		TAILQ_INSERT_TAIL(&tqpair->send_free, &tqpair->send_slots[i], link);	/* H1 */
 		if (tqpair->mr_local) {
 			rc = fi_mr_reg(tqpair->domain, tqpair->recv_slots[i].buf,
-				       NVME_OFI_RECV_BUF_SIZE, FI_RECV, 0, 0, 0,
+				       recv_buf_size, FI_RECV, 0, 0, 0,
 				       &tqpair->recv_slots[i].mr, NULL);
 			if (rc != 0) {
 				SPDK_ERRLOG("ofi host: fi_mr_reg(recv): %s\n", fi_strerror(-rc));
@@ -1268,6 +1320,9 @@ nvme_ofi_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 	SPDK_INFOLOG(nvme_ofi, "ofi host qpair %u created (qsize=%u mr_local=%d)\n",
 		     qid, qsize, tqpair->mr_local);
 	spdk_trace_record(TRACE_NVME_OFI_HOST_QP_CREATE, tqpair->qpair.id, 0, 0, qsize);
+	if (qid != 0) {
+		__atomic_add_fetch(&tctrlr->io_qpair_count, 1, __ATOMIC_RELEASE);
+	}
 	return &tqpair->qpair;
 
 err:
@@ -1305,8 +1360,10 @@ nvme_ofi_qpair_free_res(struct nvme_ofi_qpair *tqpair)
 	free(tqpair->cid_free);		/* H2 */
 	/* Post-mortem MR-cache summary — the host has no RPC server, so qpair teardown is
 	 * the only window to read the #3 counters (visible at --log-level notice). */
-	SPDK_NOTICELOG("ofi host qpair torn down: MR cache reg=%lu hit=%lu evict=%lu grow=%lu (final cap=%u)\n",
+	SPDK_NOTICELOG("ofi host qpair torn down: MR cache reg=%lu hit=%lu evict=%lu grow=%lu "
+		       "inline_h2c=%lu inline_c2h=%lu rma=%lu (final cap=%u)\n",
 		       tqpair->mr_reg, tqpair->mr_hit, tqpair->mr_evict, tqpair->mr_grow,
+		       tqpair->inline_h2c, tqpair->inline_c2h, tqpair->rma_submits,
 		       tqpair->mr_cache_cap);
 	/* Close the V2 remote-data MRs (registered lazily by nvme_ofi_mr_get). EP is torn
 	 * down before free_res (delete_io_qpair → ep_teardown), so no RMA is in flight. */
@@ -1343,10 +1400,15 @@ static int
 nvme_ofi_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
 {
 	struct nvme_ofi_qpair *tqpair = nvme_ofi_qpair(qpair);
+	struct nvme_ofi_ctrlr *tctrlr = nvme_ofi_ctrlr(ctrlr);
 
 	nvme_ofi_ep_teardown(tqpair);
 	if (tqpair->sb_sock) {
 		spdk_sock_close(&tqpair->sb_sock);
+	}
+	if (qpair->id != 0) {
+		assert(__atomic_load_n(&tctrlr->io_qpair_count, __ATOMIC_RELAXED) > 0);
+		__atomic_sub_fetch(&tctrlr->io_qpair_count, 1, __ATOMIC_RELEASE);
 	}
 	nvme_ofi_qpair_free_res(tqpair);
 	return 0;
@@ -1872,6 +1934,22 @@ nvme_ofi_submit_rollback(struct nvme_ofi_qpair *tqpair, uint16_t cid)
 	nvme_ofi_cid_put(tqpair, cid);
 }
 
+static void
+nvme_ofi_submit_commit(struct nvme_ofi_qpair *tqpair, struct nvme_request *req,
+		       uint16_t cid, bool use_rma, bool use_inline,
+		       enum spdk_nvme_data_transfer xfer)
+{
+	tqpair->req_table[cid] = req;
+	tqpair->active_reqs++;
+	if (use_rma) {
+		tqpair->rma_submits++;
+	} else if (use_inline && xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
+		tqpair->inline_h2c++;
+	} else if (use_inline && xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
+		tqpair->inline_c2h++;
+	}
+}
+
 static int
 nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *req)
 {
@@ -1881,8 +1959,12 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	uint16_t cid;
 	uint64_t tag;
 	uint32_t send_len;
-	bool has_incap_data = false;	/* V1 H2C in-capsule payload appended after the SQE */
+	bool has_incap_data = false;	/* H2C payload appended after the SQE */
 	bool has_rma_key_ext = false;
+	bool use_inline = false;
+	bool inline_qpair_allowed;
+	bool use_rma;
+	uint32_t io_qpair_count;
 	struct nvme_ofi_rma_key_ext rma_key_ext = {};
 	struct iovec iov;
 	struct fi_msg msg = {0};
@@ -1932,8 +2014,26 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 		xfer = spdk_nvme_opc_get_data_transfer(req->cmd.opc);
 	}
 
-	bool use_rma = tqpair->use_rma && !is_connect &&
-		       xfer != SPDK_NVME_DATA_NONE && req->payload_size > 0;
+	/* A V2-capable qpair may choose eager MSG framing per request. Keep complex
+	 * SGL payloads on the RMA/bounce path. Contiguous eager H2C gathers once into
+	 * a send slot; eager C2H scatters once from the receive slot on completion.
+	 * CXI MSG traffic does not scale across qpairs like RMA. The default permits
+	 * eager framing on up to four IO qpairs only when a multi-qpair workload has
+	 * no request already active on this qpair. This preserves QD1 latency while
+	 * a deep queue moves to RMA after its first request. A single IO qpair stays
+	 * eager at every depth. A zero limit explicitly requests the experimental
+	 * unlimited mode. */
+	io_qpair_count = __atomic_load_n(&tqpair->tctrlr->io_qpair_count, __ATOMIC_ACQUIRE);
+	inline_qpair_allowed = tqpair->tctrlr->inline_qpair_limit == 0 ||
+			       (io_qpair_count <= tqpair->tctrlr->inline_qpair_limit &&
+				(io_qpair_count <= 1 || tqpair->active_reqs == 0));
+
+	use_inline = tqpair->use_rma && !is_connect &&
+		     xfer != SPDK_NVME_DATA_NONE && req->payload_size > 0 &&
+		     req->payload_size <= tqpair->tctrlr->inline_threshold &&
+		     req->payload.reset_sgl_fn == NULL && inline_qpair_allowed;
+	use_rma = tqpair->use_rma && !is_connect &&
+		  xfer != SPDK_NVME_DATA_NONE && req->payload_size > 0 && !use_inline;
 
 	/* The core does NOT build the SGL for fabric transports (nvme_tcp_req_init
 	 * does, nvme_tcp.c:872-916); a zero-length SGL makes the target downgrade the
@@ -1946,7 +2046,7 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 		 *   - multi-segment SGL: gather into a per-qpair bounce buffer (one CPU copy;
 		 *     design §6.3.2 — portable across CXI rma_iov_limit=1 and verbs>1) and
 		 *     register that. Either way a single keyed SGL is advertised. */
-		void *rma_buf = req->payload.contig_or_cb_arg;
+		void *rma_buf = (char *)req->payload.contig_or_cb_arg + req->payload_offset;
 		struct nvme_ofi_bounce *bounce = NULL;
 		uint64_t rma_addr, rma_key;
 		uint32_t mr_idx;
@@ -2006,7 +2106,7 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 		 * bare 64-byte SQE and retain the inject-direct fast path. */
 		send_len = sizeof(req->cmd) + (has_rma_key_ext ? sizeof(rma_key_ext) : 0);
 	} else {
-		/* V1 in-capsule:
+		/* In-capsule path (V1, or an adaptive small V2 request):
 		 *   - HOST_TO_CONTROLLER: data block lives in *this* capsule at offset 0.
 		 *   - CONTROLLER_TO_HOST: transport data block; data rides the response. */
 		req->cmd.dptr.sgl1.unkeyed.length = req->payload_size;
@@ -2074,13 +2174,13 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 		}
 		/* inject completes inline: no slot held, no tx completion to recycle. The
 		 * cid stays reserved in req_table until the response CQE arrives. */
-		tqpair->req_table[cid] = req;
+		nvme_ofi_submit_commit(tqpair, req, cid, use_rma, use_inline, xfer);
 		spdk_trace_record(TRACE_NVME_OFI_HOST_SUBMIT, tqpair->qpair.id, 0, (uintptr_t)req,
 				  (uintptr_t)req->cb_arg, (uint32_t)cid);
 		return 0;
 	}
 
-	/* Slot path: V1 in-capsule data, or a capsule larger than inject_size (e.g. a
+	/* Slot path: in-capsule data, or a capsule larger than inject_size (e.g. a
 	 * provider with inject_size < 64 — then even the bare V2 SQE lands here, keeping
 	 * the #20 protection via the slot's FI_SEND completion). Assemble in a send slot
 	 * (H1: O(1) free-list pop) and fi_sendmsg. */
@@ -2094,7 +2194,8 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	if (has_rma_key_ext) {
 		memcpy((char *)slot->buf + sizeof(req->cmd), &rma_key_ext, sizeof(rma_key_ext));
 	} else if (has_incap_data) {
-		memcpy((char *)slot->buf + sizeof(req->cmd), req->payload.contig_or_cb_arg,
+		memcpy((char *)slot->buf + sizeof(req->cmd),
+		       (char *)req->payload.contig_or_cb_arg + req->payload_offset,
 		       req->payload_size);
 	}
 
@@ -2126,7 +2227,7 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	}
 
 	slot->cid = cid;
-	tqpair->req_table[cid] = req;
+	nvme_ofi_submit_commit(tqpair, req, cid, use_rma, use_inline, xfer);
 	spdk_trace_record(TRACE_NVME_OFI_HOST_SUBMIT, tqpair->qpair.id, 0, (uintptr_t)req,
 			  (uintptr_t)req->cb_arg, (uint32_t)cid);
 	return 0;
