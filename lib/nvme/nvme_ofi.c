@@ -74,6 +74,7 @@
 #define NVME_OFI_IN_CAPSULE_DATA_SIZE	4096
 #define NVME_OFI_CXI_INLINE_THRESHOLD_DEFAULT	4096
 #define NVME_OFI_INLINE_QPAIR_LIMIT_DEFAULT	4
+#define NVME_OFI_4K_H2C_INLINE_ACTIVE_LIMIT	4
 
 /* V2 RMA single-transfer ceiling — MUST match the target's per-req bounce buffer
  * (NVMF_OFI_RMA_DATA_SIZE in lib/nvmf/ofi.c). */
@@ -1963,6 +1964,7 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	bool has_rma_key_ext = false;
 	bool use_inline = false;
 	bool inline_qpair_allowed;
+	bool inline_occupancy_allowed;
 	bool use_rma;
 	uint32_t io_qpair_count;
 	struct nvme_ofi_rma_key_ext rma_key_ext = {};
@@ -2021,12 +2023,20 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	 * eager framing on up to four IO qpairs only when a multi-qpair workload has
 	 * no request already active on this qpair. This preserves QD1 latency while
 	 * a deep queue moves to RMA after its first request. A single IO qpair stays
-	 * eager at every depth. A zero limit explicitly requests the experimental
-	 * unlimited mode. */
+	 * eager at every depth for sub-4 KiB transfers and C2H data. For a full 4 KiB
+	 * H2C transfer, keep the first four requests eager, then use RMA: CXI
+	 * measurements show that the eager copy and larger MSG stop paying back at
+	 * deeper write occupancy. A zero qpair limit explicitly requests the
+	 * experimental unlimited mode and bypasses both occupancy rules. */
 	io_qpair_count = __atomic_load_n(&tqpair->tctrlr->io_qpair_count, __ATOMIC_ACQUIRE);
+	inline_occupancy_allowed = io_qpair_count <= 1 ?
+		(req->payload_size < NVME_OFI_IN_CAPSULE_DATA_SIZE ||
+		 xfer != SPDK_NVME_DATA_HOST_TO_CONTROLLER ||
+		 tqpair->active_reqs < NVME_OFI_4K_H2C_INLINE_ACTIVE_LIMIT) :
+		(tqpair->active_reqs == 0);
 	inline_qpair_allowed = tqpair->tctrlr->inline_qpair_limit == 0 ||
 			       (io_qpair_count <= tqpair->tctrlr->inline_qpair_limit &&
-				(io_qpair_count <= 1 || tqpair->active_reqs == 0));
+				inline_occupancy_allowed);
 
 	use_inline = tqpair->use_rma && !is_connect &&
 		     xfer != SPDK_NVME_DATA_NONE && req->payload_size > 0 &&
