@@ -161,6 +161,17 @@ nvme_check_io(struct ns_worker_ctx *ns_ctx)
 			rc = spdk_nvme_ctrlr_reconnect_io_qpair(ns_ctx->qpair[i]);
 			/* successful reconnect */
 			if (rc == 0) {
+				/* Requests aborted during disconnect invoke their callbacks before
+				 * this qpair is usable, so callback-driven replacement submissions
+				 * may fail and reduce current_queue_depth. Restore the intended
+				 * workload after reconnect instead of silently running at QD0. */
+				if (ns_ctx->current_queue_depth < (uint64_t)g_queue_depth) {
+					uint32_t refill = g_queue_depth - ns_ctx->current_queue_depth;
+
+					submit_io(ns_ctx, refill);
+					fprintf(stderr, "I/O qpair reconnected; restored queue depth with %u requests.\n",
+						refill);
+				}
 				continue;
 			} else if (rc == -ENXIO) {
 				/* This means the controller is failed. Defer to it to restore the qpair. */

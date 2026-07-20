@@ -1075,6 +1075,8 @@ spdk_nvme_transport_id_populate_trstring(struct spdk_nvme_transport_id *trid, co
 int
 spdk_nvme_transport_id_parse_trtype(enum spdk_nvme_transport_type *trtype, const char *str)
 {
+	const struct spdk_nvme_transport *transport;
+
 	if (trtype == NULL || str == NULL) {
 		return -EINVAL;
 	}
@@ -1090,7 +1092,12 @@ spdk_nvme_transport_id_parse_trtype(enum spdk_nvme_transport_type *trtype, const
 	} else if (strcasecmp(str, "VFIOUSER") == 0) {
 		*trtype = SPDK_NVME_TRANSPORT_VFIOUSER;
 	} else {
-		*trtype = SPDK_NVME_TRANSPORT_CUSTOM;
+		/* A named custom transport can still declare that it implements Fabrics
+		 * semantics. Preserve that registered type so controller reset, qpair
+		 * reconnect, and poll-group handling take the Fabrics paths. */
+		transport = nvme_get_transport(str);
+		*trtype = transport != NULL ? nvme_transport_get_trtype(transport) :
+			  SPDK_NVME_TRANSPORT_CUSTOM;
 	}
 	return 0;
 }
@@ -1110,6 +1117,7 @@ spdk_nvme_transport_id_trtype_str(enum spdk_nvme_transport_type trtype)
 	case SPDK_NVME_TRANSPORT_VFIOUSER:
 		return "VFIOUSER";
 	case SPDK_NVME_TRANSPORT_CUSTOM:
+	case SPDK_NVME_TRANSPORT_CUSTOM_FABRICS:
 		return "CUSTOM";
 	default:
 		return NULL;
@@ -1376,7 +1384,8 @@ spdk_nvme_transport_id_compare(const struct spdk_nvme_transport_id *trid1,
 {
 	int cmp;
 
-	if (trid1->trtype == SPDK_NVME_TRANSPORT_CUSTOM) {
+	if (trid1->trtype == SPDK_NVME_TRANSPORT_CUSTOM ||
+	    trid1->trtype == SPDK_NVME_TRANSPORT_CUSTOM_FABRICS) {
 		cmp = strcasecmp(trid1->trstring, trid2->trstring);
 	} else {
 		cmp = cmp_int(trid1->trtype, trid2->trtype);

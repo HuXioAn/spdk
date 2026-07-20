@@ -170,6 +170,9 @@ spdk_nvme_build_name(char *name, size_t length, struct spdk_nvme_ctrlr *ctrlr,
 	case SPDK_NVME_TRANSPORT_CUSTOM:
 		res = snprintf(name, length, "CUSTOM (%s)", trid->traddr);
 		break;
+	case SPDK_NVME_TRANSPORT_CUSTOM_FABRICS:
+		res = snprintf(name, length, "%s (%s)", trid->trstring, trid->traddr);
+		break;
 	default:
 		fprintf(stderr, "Unknown transport type %d\n", trid->trtype);
 		res = -EINVAL;

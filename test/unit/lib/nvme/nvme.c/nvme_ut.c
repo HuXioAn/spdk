@@ -35,6 +35,10 @@ DEFINE_STUB(nvme_transport_ctrlr_construct, struct spdk_nvme_ctrlr *,
 DEFINE_STUB_V(nvme_io_msg_ctrlr_detach, (struct spdk_nvme_ctrlr *ctrlr));
 DEFINE_STUB(spdk_nvme_transport_available, bool,
 	    (enum spdk_nvme_transport_type trtype), true);
+DEFINE_STUB(nvme_get_transport, const struct spdk_nvme_transport *,
+	    (const char *transport_name), NULL);
+DEFINE_STUB(nvme_transport_get_trtype, enum spdk_nvme_transport_type,
+	    (const struct spdk_nvme_transport *transport), SPDK_NVME_TRANSPORT_CUSTOM);
 DEFINE_STUB(spdk_pci_event_listen, int, (void), 0);
 DEFINE_STUB(spdk_nvme_poll_group_process_completions, int64_t, (struct spdk_nvme_poll_group *group,
 		uint32_t completions_per_qpair, spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb), 0);
@@ -1037,6 +1041,13 @@ test_trid_parse_and_compare(void)
 	ret = spdk_nvme_transport_id_compare(&trid1, &trid2);
 	CU_ASSERT(ret == 0);
 
+	/* Distinct custom Fabrics transports are identified by transport name. */
+	memset_trid(&trid1, &trid2);
+	trid1.trtype = trid2.trtype = SPDK_NVME_TRANSPORT_CUSTOM_FABRICS;
+	snprintf(trid1.trstring, sizeof(trid1.trstring), "OFI");
+	snprintf(trid2.trstring, sizeof(trid2.trstring), "OTHER");
+	CU_ASSERT(spdk_nvme_transport_id_compare(&trid1, &trid2) < 0);
+
 	/* Compare PCI addresses via spdk_pci_addr_compare (rather than as strings) */
 	memset_trid(&trid1, &trid2);
 	CU_ASSERT(spdk_nvme_transport_id_parse(&trid1, "trtype:PCIe traddr:0000:04:00.0") == 0);
@@ -1071,7 +1082,6 @@ test_trid_parse_and_compare(void)
 static void
 test_spdk_nvme_transport_id_parse_trtype(void)
 {
-
 	enum spdk_nvme_transport_type *trtype;
 	enum spdk_nvme_transport_type sct;
 	char *str;
@@ -1092,6 +1102,15 @@ test_spdk_nvme_transport_id_parse_trtype(void)
 	str = "unit_test";
 	CU_ASSERT(spdk_nvme_transport_id_parse_trtype(trtype, str) == 0);
 	CU_ASSERT((*trtype) == SPDK_NVME_TRANSPORT_CUSTOM);
+
+	/* A registered named transport supplies its actual custom type. */
+	MOCK_SET(nvme_get_transport, (const struct spdk_nvme_transport *)(uintptr_t)1);
+	MOCK_SET(nvme_transport_get_trtype, SPDK_NVME_TRANSPORT_CUSTOM_FABRICS);
+	str = "OFI";
+	CU_ASSERT(spdk_nvme_transport_id_parse_trtype(trtype, str) == 0);
+	CU_ASSERT((*trtype) == SPDK_NVME_TRANSPORT_CUSTOM_FABRICS);
+	MOCK_CLEAR_P(nvme_get_transport);
+	MOCK_CLEAR(nvme_transport_get_trtype);
 
 	/* test trtype value when use function "strcasecmp" to compare str and "PCIe"，not case-sensitive */
 	str = "PCIe";
@@ -1215,6 +1234,10 @@ test_trid_trtype_str(void)
 	s = spdk_nvme_transport_id_trtype_str(SPDK_NVME_TRANSPORT_TCP);
 	SPDK_CU_ASSERT_FATAL(s != NULL);
 	CU_ASSERT(strcmp(s, "TCP") == 0);
+
+	s = spdk_nvme_transport_id_trtype_str(SPDK_NVME_TRANSPORT_CUSTOM_FABRICS);
+	SPDK_CU_ASSERT_FATAL(s != NULL);
+	CU_ASSERT(strcmp(s, "CUSTOM") == 0);
 }
 
 static void

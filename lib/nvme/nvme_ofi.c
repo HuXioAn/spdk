@@ -99,6 +99,8 @@
 
 const struct spdk_nvme_transport_ops nvme_ofi_ops;
 
+static void nvme_ofi_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr);
+
 /* Host-side sideband handshake state (design §5.3, active role). */
 enum nvme_ofi_sb_state {
 	NVME_OFI_SB_INIT = 0,		/* connect the sideband socket */
@@ -456,7 +458,7 @@ nvme_ofi_ep_teardown(struct nvme_ofi_qpair *tqpair)
 			for (i = 0; i < tqpair->num_slots; i++) {
 				pending += tqpair->recv_slots[i].posted ? 1 : 0;
 			}
-			if (pending == 0 || tqpair->cq == NULL) {
+			if (tqpair->cq == NULL) {
 				break;
 			}
 			rc = fi_cq_read(tqpair->cq, entries, NVME_OFI_CQ_BATCH_MAX);
@@ -472,6 +474,9 @@ nvme_ofi_ep_teardown(struct nvme_ofi_qpair *tqpair)
 				continue;
 			}
 			if (rc == -FI_EAGAIN) {
+				if (pending == 0) {
+					break;
+				}
 				continue;
 			}
 			if (rc < 0) {
@@ -522,6 +527,46 @@ nvme_ofi_ep_teardown(struct nvme_ofi_qpair *tqpair)
 		tqpair->ep = NULL;
 	}
 	tqpair->ep_enabled = false;
+}
+
+/* Rebuild endpoint-local bookkeeping after a completed teardown. The CQ, AV,
+ * registered slot buffers, and non-endpoint-bound data MRs belong to the qpair
+ * domain and may be reused; state that tracked work on the old EP starts empty. */
+static void
+nvme_ofi_qpair_prepare_reconnect(struct nvme_ofi_qpair *tqpair)
+{
+	uint32_t i;
+
+	TAILQ_INIT(&tqpair->pending_recvs);
+	TAILQ_INIT(&tqpair->send_free);
+	for (i = 0; i < tqpair->num_slots; i++) {
+		tqpair->recv_slots[i].posted = false;
+		TAILQ_INSERT_TAIL(&tqpair->send_free, &tqpair->send_slots[i], link);
+	}
+
+	/* FI_MR_ENDPOINT registrations were closed during EP teardown. Rebuild the
+	 * free list for those slots while retaining domain-scoped registrations. */
+	tqpair->mr_free_head = UINT32_MAX;
+	for (i = tqpair->mr_cache_cap; i > 0; i--) {
+		struct nvme_ofi_mr_cache_entry *entry = &tqpair->mr_cache[i - 1];
+
+		assert(entry->refcnt == 0);
+		if (entry->mr == NULL) {
+			entry->buf = NULL;
+			entry->len = 0;
+			entry->addr = 0;
+			entry->key = 0;
+			entry->next_free = tqpair->mr_free_head;
+			tqpair->mr_free_head = i - 1;
+		}
+	}
+
+	tqpair->sb_rx_off = 0;
+	tqpair->sb_tx_off = 0;
+	tqpair->sb_tx_len = 0;
+	tqpair->local_ep_addr_len = 0;
+	tqpair->peer_ep_addr_len = 0;
+	tqpair->destroying = false;
 }
 
 /* Bring up the per-qpair endpoint on its domain. Bind the address vector and
@@ -762,6 +807,7 @@ nvme_ofi_complete_request(struct nvme_ofi_qpair *tqpair, uint16_t cid,
 	struct nvme_ofi_outstanding *o;
 	struct nvme_request *req;
 	struct spdk_nvme_cpl rsp;
+	bool was_in_completion_context;
 
 	if (cid >= tqpair->req_table_sz || tqpair->req_table[cid] == NULL) {
 		SPDK_ERRLOG("ofi host: CQE for unknown cid %u\n", cid);
@@ -776,7 +822,8 @@ nvme_ofi_complete_request(struct nvme_ofi_qpair *tqpair, uint16_t cid,
 
 	/* A multi-segment READ landed in a bounce buffer; scatter it back into
 	 * the caller's SGL before completing. (V2 RMA path, data==NULL here.) */
-	if (o->bounce != NULL && o->need_scatter && req->payload.reset_sgl_fn != NULL) {
+	if (!spdk_nvme_cpl_is_error(cpl) && o->bounce != NULL && o->need_scatter &&
+	    req->payload.reset_sgl_fn != NULL) {
 		nvme_ofi_buf_to_sgl(&req->payload, req->payload_offset, req->payload_size,
 				    o->bounce->buf);
 	}
@@ -791,7 +838,7 @@ nvme_ofi_complete_request(struct nvme_ofi_qpair *tqpair, uint16_t cid,
 
 	/* CONTROLLER_TO_HOST data (READ): copy the in-capsule data into the req payload
 	 * before completing. (V1 single-segment contig only; multi-seg is V2/bounce above.) */
-	if (data != NULL && data_len > 0 &&
+	if (!spdk_nvme_cpl_is_error(cpl) && data != NULL && data_len > 0 &&
 	    spdk_nvme_opc_get_data_transfer(req->cmd.opc) == SPDK_NVME_DATA_CONTROLLER_TO_HOST &&
 	    req->payload.reset_sgl_fn == NULL) {
 		memcpy((char *)req->payload.contig_or_cb_arg + req->payload_offset, data,
@@ -802,8 +849,16 @@ nvme_ofi_complete_request(struct nvme_ofi_qpair *tqpair, uint16_t cid,
 			  (uintptr_t)req->cb_arg, (uint32_t)cid, (uint32_t)cpl->status.sc);
 
 	rsp = *cpl;
-	/* nvme_complete_request invokes the user callback (right signature) + frees req. */
+	/* Poll groups bypass spdk_nvme_qpair_process_completions(), which normally
+	 * establishes this context. Protect the callback itself, while avoiding two
+	 * qpair stores on every empty busy-poll iteration. Preserve an outer context
+	 * when this completion came through the normal per-qpair API. */
+	was_in_completion_context = tqpair->qpair.in_completion_context;
+	tqpair->qpair.in_completion_context = 1;
 	nvme_complete_request(req->cb_fn, req->cb_arg, req->qpair, req, &rsp);
+	if (!was_in_completion_context) {
+		tqpair->qpair.in_completion_context = 0;
+	}
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1300,12 +1355,15 @@ nvme_ofi_drain_cq(struct nvme_ofi_qpair *tqpair, uint32_t max_completions)
 				    err.err, fi_strerror(err.err), err.prov_errno,
 				    (unsigned long)err.flags, err.len, err.olen);
 			spdk_trace_record(TRACE_NVME_OFI_HOST_CQ_ERROR, tqpair->qpair.id, 0, 0, err.err);
+			tqpair->qpair.transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_REMOTE;
 			nvme_ctrlr_disconnect_qpair(&tqpair->qpair);
 			return -ENXIO;
 		}
 		if (rc < 0) {
-			SPDK_ERRLOG("ofi host: fi_cq_read: %zd\n", rc);
-			break;
+			SPDK_ERRLOG("ofi host: fi_cq_read: %s\n", fi_strerror(-(int)rc));
+			tqpair->qpair.transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_UNKNOWN;
+			nvme_ctrlr_disconnect_qpair(&tqpair->qpair);
+			return -ENXIO;
 		}
 
 		for (k = 0; k < rc; k++) {
@@ -1569,6 +1627,9 @@ nvme_ofi_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpa
 	if (tqpair->sb_sock != NULL) {
 		return 0;	/* already initiating (e.g. reconnect) */
 	}
+	if (tqpair->destroying) {
+		nvme_ofi_qpair_prepare_reconnect(tqpair);
+	}
 
 	port = spdk_strtol(trid->trsvcid, 10);
 	if (port <= 0 || port > UINT16_MAX) {
@@ -1600,18 +1661,17 @@ nvme_ofi_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 {
 	struct nvme_ofi_qpair *tqpair = nvme_ofi_qpair(qpair);
 
-	/* The core polls process_completions while the qpair is DISCONNECTING and
-	 * waits for it to reach DISCONNECTED (nvme_ctrlr.c:618). Our EP teardown is
-	 * synchronous, so tear everything down and advance straight to DISCONNECTED
-	 * before returning — otherwise the core spins forever. */
-	nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTING);
+	/* Endpoint teardown makes it safe to complete every transport-owned request.
+	 * Use the common disconnect-done path so queued core requests and poll-group
+	 * notification state are finalized exactly as they are for TCP and RDMA. */
 	nvme_ofi_ep_teardown(tqpair);
 	if (tqpair->sb_sock) {
 		spdk_sock_close(&tqpair->sb_sock);
 		tqpair->sb_sock = NULL;
 	}
 	tqpair->sb_state = NVME_OFI_SB_INIT;
-	nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTED);
+	nvme_ofi_qpair_abort_reqs(qpair, qpair->abort_dnr);
+	nvme_transport_ctrlr_disconnect_qpair_done(qpair);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2103,7 +2163,7 @@ nvme_ofi_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr)
 	uint32_t i;
 
 	cpl.status.sct = SPDK_NVME_SCT_GENERIC;
-	cpl.status.sc = SPDK_NVME_SC_ABORTED_BY_REQUEST;
+	cpl.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;
 	cpl.status.dnr = dnr ? 1 : 0;
 
 	for (i = 0; i < tqpair->req_table_sz; i++) {
@@ -2219,22 +2279,67 @@ nvme_ofi_poll_group_process_completions(struct spdk_nvme_transport_poll_group *g
 					spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
 {
 	struct spdk_nvme_qpair *qpair, *tmp;
-	int64_t total = 0, rc;
+	int64_t total = 0, error = 0, rc;
+
+	STAILQ_FOREACH_SAFE(qpair, &group->disconnected_qpairs, poll_group_stailq, tmp) {
+		if (nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTED) {
+			disconnected_qpair_cb(qpair, group->group->ctx);
+		}
+	}
 
 	/* Each qpair owns its CQ; drain every connected qpair. The core maintains
 	 * the connected_qpairs membership. */
 	STAILQ_FOREACH_SAFE(qpair, &group->connected_qpairs, poll_group_stailq, tmp) {
-		rc = nvme_ofi_qpair_process_completions(qpair, completions_per_qpair);
-		if (rc > 0) {
+		/* A poll-group transport drives its qpairs directly and therefore bypasses
+		 * spdk_nvme_qpair_process_completions()'s controller-failed check. Propagate
+		 * an admin-qpair failure to every IO qpair so requests on quiet CXI EPs do
+		 * not remain outstanding indefinitely after the target disappears. */
+		if (spdk_unlikely(qpair->ctrlr->is_failed) &&
+		    nvme_qpair_get_state(qpair) != NVME_QPAIR_DISCONNECTING &&
+		    nvme_qpair_get_state(qpair) != NVME_QPAIR_DISCONNECTED) {
+			qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_REMOTE;
+			nvme_ctrlr_disconnect_qpair(qpair);
+			rc = -ENXIO;
+		} else {
+			rc = nvme_ofi_qpair_process_completions(qpair, completions_per_qpair);
+		}
+		if (rc < 0) {
+			if (nvme_qpair_get_state(qpair) != NVME_QPAIR_DISCONNECTING &&
+			    nvme_qpair_get_state(qpair) != NVME_QPAIR_DISCONNECTED) {
+				if (qpair->transport_failure_reason == SPDK_NVME_QPAIR_FAILURE_NONE) {
+					qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_UNKNOWN;
+				}
+				nvme_ctrlr_disconnect_qpair(qpair);
+			}
+			if (error == 0) {
+				error = rc;
+			}
+		} else {
 			total += rc;
 		}
+		if (qpair->delete_after_completion_context) {
+			spdk_nvme_ctrlr_free_io_qpair(qpair);
+		}
 	}
-	return total;
+	return error != 0 ? error : total;
+}
+
+/* Interrupt-mode transports use this hook before waiting on their fd group.
+ * OFI currently uses busy polling, so match TCP/RDMA's no-op implementation. */
+static void
+nvme_ofi_poll_group_check_disconnected_qpairs(struct spdk_nvme_transport_poll_group *group,
+		spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
+{
 }
 
 static int
 nvme_ofi_poll_group_destroy(struct spdk_nvme_transport_poll_group *group)
 {
+	if (!STAILQ_EMPTY(&group->connected_qpairs) ||
+	    !STAILQ_EMPTY(&group->disconnected_qpairs)) {
+		return -EBUSY;
+	}
+
 	free(group);
 	return 0;
 }
@@ -2283,6 +2388,7 @@ const struct spdk_nvme_transport_ops nvme_ofi_ops = {
 	.poll_group_add = nvme_ofi_poll_group_add,
 	.poll_group_remove = nvme_ofi_poll_group_remove,
 	.poll_group_process_completions = nvme_ofi_poll_group_process_completions,
+	.poll_group_check_disconnected_qpairs = nvme_ofi_poll_group_check_disconnected_qpairs,
 	.poll_group_destroy = nvme_ofi_poll_group_destroy,
 };
 
