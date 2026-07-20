@@ -15,6 +15,7 @@
  */
 
 #include "spdk/stdinc.h"
+#include "spdk/env.h"
 #include "spdk/sock.h"
 #include "spdk/thread.h"
 #include "spdk/nvme.h"
@@ -236,6 +237,20 @@ struct spdk_nvmf_ofi_pg_stat {
 	uint64_t	no_free_reqs;		/* received commands without a free request */
 	uint64_t	cq_errors;		/* cq_tx/cq_rx -FI_EAVAIL */
 	uint64_t	recv_repost_defer;	/* recv re-posts deferred to pending_recvs */
+	/* Opt-in phase timing. Tick totals are paired with counts so analysis can
+	 * report per-request means without emitting a trace event for every I/O. */
+	uint64_t	rx_to_action_ticks;
+	uint64_t	rx_to_action_count;
+	uint64_t	exec_ticks;
+	uint64_t	exec_count;
+	uint64_t	h2c_rma_ticks;
+	uint64_t	h2c_rma_count;
+	uint64_t	c2h_rma_ticks;
+	uint64_t	c2h_rma_count;
+	uint64_t	send_completion_ticks;
+	uint64_t	send_completion_count;
+	uint64_t	request_residence_ticks;
+	uint64_t	request_residence_count;
 };
 
 struct spdk_nvmf_ofi_poll_group {
@@ -376,8 +391,47 @@ struct spdk_nvmf_ofi_req {
 	uint64_t				rma_addr;	/* host buffer addr (vaddr or offset) */
 	uint64_t				rma_key;	/* host MR key */
 	uint32_t				cqe_len;	/* CQE capsule length for a deferred send */
+	uint64_t				diag_receive_tsc;
+	uint64_t				diag_rma_tsc;
+	uint64_t				diag_exec_tsc;
+	uint64_t				diag_send_tsc;
+	bool					diag_first_action_recorded;
 	TAILQ_ENTRY(spdk_nvmf_ofi_req)		link;
 };
+
+static inline bool
+nvmf_ofi_req_diagnostics_enabled(const struct spdk_nvmf_ofi_req *oreq)
+{
+	/* Admin AERs can remain outstanding for the entire benchmark window. Mixing
+	 * their lifetime into data-path phase means makes the apparent per-I/O
+	 * residence inversely proportional to workload IOPS. */
+	return oreq->oqpair->transport->diagnostics_enabled && oreq->oqpair->qpair.qid != 0;
+}
+
+static inline void
+nvmf_ofi_diag_first_action(struct spdk_nvmf_ofi_req *oreq)
+{
+	struct spdk_nvmf_ofi_pg_stat *stat;
+
+	if (!nvmf_ofi_req_diagnostics_enabled(oreq) || oreq->diag_first_action_recorded ||
+	    oreq->diag_receive_tsc == 0) {
+		return;
+	}
+	stat = &oreq->oqpair->group->stat;
+	stat->rx_to_action_ticks += spdk_get_ticks() - oreq->diag_receive_tsc;
+	stat->rx_to_action_count++;
+	oreq->diag_first_action_recorded = true;
+}
+
+static inline void
+nvmf_ofi_request_exec(struct spdk_nvmf_ofi_req *oreq)
+{
+	nvmf_ofi_diag_first_action(oreq);
+	if (nvmf_ofi_req_diagnostics_enabled(oreq)) {
+		oreq->diag_exec_tsc = spdk_get_ticks();
+	}
+	spdk_nvmf_request_exec(&oreq->req);
+}
 
 static inline bool
 nvmf_ofi_qpair_uses_multi_recv(const struct spdk_nvmf_ofi_qpair *oqpair)
@@ -1791,6 +1845,7 @@ nvmf_ofi_post_rma(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_req *
 {
 	ssize_t rc;
 
+	nvmf_ofi_diag_first_action(oreq);
 	oreq->rma_is_read = is_read;
 	oreq->rma_with_cqe = false;
 	oreq->ordered_cqe = false;
@@ -1813,6 +1868,9 @@ nvmf_ofi_post_rma(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_req *
 		SPDK_ERRLOG("ofi target: fi_%s: %s\n", is_read ? "read" : "write",
 			    fi_strerror(-(int)rc));
 		return (int)rc;
+	}
+	if (nvmf_ofi_req_diagnostics_enabled(oreq)) {
+		oreq->diag_rma_tsc = spdk_get_ticks();
 	}
 	return 0;
 }
@@ -1843,6 +1901,9 @@ nvmf_ofi_post_rma_cqe(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_r
 		SPDK_ERRLOG("ofi target: fi_writemsg(CQE): %s\n", fi_strerror(-(int)rc));
 		return (int)rc;
 	}
+	if (nvmf_ofi_req_diagnostics_enabled(oreq)) {
+		oreq->diag_rma_tsc = spdk_get_ticks();
+	}
 	return 0;
 }
 
@@ -1851,8 +1912,21 @@ nvmf_ofi_post_rma_cqe(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_r
 static void
 nvmf_ofi_rma_done(struct spdk_nvmf_ofi_req *oreq)
 {
+	if (nvmf_ofi_req_diagnostics_enabled(oreq) && oreq->diag_rma_tsc != 0) {
+		struct spdk_nvmf_ofi_pg_stat *stat = &oreq->oqpair->group->stat;
+		uint64_t elapsed = spdk_get_ticks() - oreq->diag_rma_tsc;
+
+		if (oreq->rma_is_read) {
+			stat->h2c_rma_ticks += elapsed;
+			stat->h2c_rma_count++;
+		} else {
+			stat->c2h_rma_ticks += elapsed;
+			stat->c2h_rma_count++;
+		}
+		oreq->diag_rma_tsc = 0;
+	}
 	if (oreq->rma_is_read) {
-		spdk_nvmf_request_exec(&oreq->req);
+		nvmf_ofi_request_exec(oreq);
 	} else {
 		/* C2H write done. */
 		if (oreq->rma_with_cqe) {
@@ -1894,6 +1968,10 @@ nvmf_ofi_ordered_send_after_write(struct spdk_nvmf_ofi_req *oreq)
 		SPDK_ERRLOG("ofi target: ordered CQE fi_sendmsg: %s; disconnecting qpair\n",
 			    fi_strerror(-(int)rc));
 		spdk_nvmf_qpair_disconnect(&oreq->oqpair->qpair);
+		return;
+	}
+	if (nvmf_ofi_req_diagnostics_enabled(oreq)) {
+		oreq->diag_send_tsc = spdk_get_ticks();
 	}
 }
 
@@ -1957,8 +2035,13 @@ nvmf_ofi_drain_pending_rma(struct spdk_nvmf_ofi_poll_group *opgroup)
 				} else {
 					nvmf_ofi_req_release(oreq);
 				}
-			} else if (oreq->ordered_cqe) {
-				nvmf_ofi_ordered_send_after_write(oreq);
+			} else {
+				if (nvmf_ofi_req_diagnostics_enabled(oreq) && !oreq->ordered_cqe) {
+					oreq->diag_rma_tsc = spdk_get_ticks();
+				}
+				if (oreq->ordered_cqe) {
+					nvmf_ofi_ordered_send_after_write(oreq);
+				}
 			}
 			/* Normal success completes later via cq_tx (FI_READ/FI_WRITE).
 			 * Ordered success is retired by the final FI_SEND completion. */
@@ -2020,6 +2103,9 @@ nvmf_ofi_drain_pending_send(struct spdk_nvmf_ofi_poll_group *opgroup)
 				}
 			} else {
 				oreq->send_in_flight = true;
+				if (nvmf_ofi_req_diagnostics_enabled(oreq)) {
+					oreq->diag_send_tsc = spdk_get_ticks();
+				}
 			}
 		}
 	}
@@ -2064,6 +2150,11 @@ nvmf_ofi_req_get(struct spdk_nvmf_ofi_qpair *oqpair)
 	req->rma_is_read = false;
 	req->rma_with_cqe = false;
 	req->ordered_cqe = false;
+	req->diag_receive_tsc = 0;
+	req->diag_rma_tsc = 0;
+	req->diag_exec_tsc = 0;
+	req->diag_send_tsc = 0;
+	req->diag_first_action_recorded = false;
 	return req;
 }
 
@@ -2073,6 +2164,13 @@ static void
 nvmf_ofi_req_release(struct spdk_nvmf_ofi_req *req)
 {
 	struct spdk_nvmf_ofi_qpair *oqpair = req->oqpair;
+
+	if (nvmf_ofi_req_diagnostics_enabled(req) && req->diag_receive_tsc != 0) {
+		oqpair->group->stat.request_residence_ticks +=
+			spdk_get_ticks() - req->diag_receive_tsc;
+		oqpair->group->stat.request_residence_count++;
+		req->diag_receive_tsc = 0;
+	}
 
 	/* During two-phase teardown the EP is already closed, but its shared CQ can
 	 * still contain send/RMA completions. Do not re-post a receive to the closed
@@ -2388,6 +2486,12 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			if (entries[k].flags & (FI_READ | FI_WRITE)) {
 				nvmf_ofi_rma_done(oreq);
 			} else {
+				if (nvmf_ofi_req_diagnostics_enabled(oreq) && oreq->diag_send_tsc != 0) {
+					opgroup->stat.send_completion_ticks +=
+						spdk_get_ticks() - oreq->diag_send_tsc;
+					opgroup->stat.send_completion_count++;
+					oreq->diag_send_tsc = 0;
+				}
 				oreq->send_in_flight = false;
 				nvmf_ofi_req_release(oreq);
 			}
@@ -2504,6 +2608,9 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			req->req.xfer = spdk_nvmf_req_get_xfer(&req->req);
 			req->recv_slot = use_multi_recv ? NULL : slot;
 			req->use_rma = false;
+			if (diagnostics_enabled) {
+				req->diag_receive_tsc = spdk_get_ticks();
+			}
 			SPDK_DEBUGLOG(nvmf_ofi, "ofi target: recv cmd opc=0x%x cid=%u len=%zu xfer=%u\n",
 				       sqe->opc, sqe->cid, entries[k].len, req->req.xfer);
 			opgroup->stat.recv_cmds++;
@@ -2593,7 +2700,7 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 				if (multi_released) {
 					nvmf_ofi_repost_recv(oqpair, slot);
 				}
-				spdk_nvmf_request_exec(&req->req);
+				nvmf_ofi_request_exec(req);
 				continue;
 			}
 
@@ -2633,7 +2740,7 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			if (multi_released) {
 				nvmf_ofi_repost_recv(oqpair, slot);
 			}
-			spdk_nvmf_request_exec(&req->req);
+			nvmf_ofi_request_exec(req);
 		}
 	}
 	if (diagnostics_enabled && batch == opgroup->transport->cq_drain_batch) {
@@ -2782,6 +2889,9 @@ nvmf_ofi_send_cqe(struct spdk_nvmf_ofi_req *oreq, uint32_t send_len)
 		return;
 	}
 	oreq->send_in_flight = true;
+	if (nvmf_ofi_req_diagnostics_enabled(oreq)) {
+		oreq->diag_send_tsc = spdk_get_ticks();
+	}
 }
 
 /*
@@ -2798,6 +2908,12 @@ nvmf_ofi_req_complete(struct spdk_nvmf_request *req)
 	struct spdk_nvmf_ofi_req *oreq = SPDK_CONTAINEROF(req, struct spdk_nvmf_ofi_req, req);
 	struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
 	uint32_t send_len = sizeof(struct spdk_nvme_cpl);
+
+	if (nvmf_ofi_req_diagnostics_enabled(oreq) && oreq->diag_exec_tsc != 0) {
+		oreq->oqpair->group->stat.exec_ticks += spdk_get_ticks() - oreq->diag_exec_tsc;
+		oreq->oqpair->group->stat.exec_count++;
+		oreq->diag_exec_tsc = 0;
+	}
 
 	SPDK_DEBUGLOG(nvmf_ofi, "ofi target: req_complete cid=%u sct=%u sc=%u xfer=%u len=%u rma=%d\n",
 		       rsp->cid, rsp->status.sct, rsp->status.sc, req->xfer, req->length,
@@ -2962,6 +3078,22 @@ nvmf_ofi_poll_group_dump_stat(struct spdk_nvmf_transport_poll_group *group,
 	spdk_json_write_named_uint64(w, "no_free_reqs", opgroup->stat.no_free_reqs);
 	spdk_json_write_named_uint64(w, "cq_errors", opgroup->stat.cq_errors);
 	spdk_json_write_named_uint64(w, "recv_repost_defer", opgroup->stat.recv_repost_defer);
+	spdk_json_write_named_uint64(w, "rx_to_action_ticks", opgroup->stat.rx_to_action_ticks);
+	spdk_json_write_named_uint64(w, "rx_to_action_count", opgroup->stat.rx_to_action_count);
+	spdk_json_write_named_uint64(w, "exec_ticks", opgroup->stat.exec_ticks);
+	spdk_json_write_named_uint64(w, "exec_count", opgroup->stat.exec_count);
+	spdk_json_write_named_uint64(w, "h2c_rma_ticks", opgroup->stat.h2c_rma_ticks);
+	spdk_json_write_named_uint64(w, "h2c_rma_count", opgroup->stat.h2c_rma_count);
+	spdk_json_write_named_uint64(w, "c2h_rma_ticks", opgroup->stat.c2h_rma_ticks);
+	spdk_json_write_named_uint64(w, "c2h_rma_count", opgroup->stat.c2h_rma_count);
+	spdk_json_write_named_uint64(w, "send_completion_ticks",
+				     opgroup->stat.send_completion_ticks);
+	spdk_json_write_named_uint64(w, "send_completion_count",
+				     opgroup->stat.send_completion_count);
+	spdk_json_write_named_uint64(w, "request_residence_ticks",
+				     opgroup->stat.request_residence_ticks);
+	spdk_json_write_named_uint64(w, "request_residence_count",
+				     opgroup->stat.request_residence_count);
 }
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ofi = {
