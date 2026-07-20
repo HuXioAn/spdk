@@ -72,6 +72,7 @@
 /* CQ entries reaped per fi_cq_read call (amortizes the per-completion libfabric
  * call overhead vs reading one at a time). Bounded by the per-CQ drain budget. */
 #define NVMF_OFI_CQ_READ_BATCH_DEFAULT	16
+#define NVMF_OFI_CXI_CQ_READ_BATCH_DEFAULT	32
 #define NVMF_OFI_CQ_READ_BATCH_MAX	64
 
 /* Upper bound for synchronously draining shared-CQ completions after an EP is
@@ -692,6 +693,8 @@ nvmf_ofi_create(struct spdk_nvmf_transport_opts *opts)
 	otransport->diagnostics_enabled = getenv("OFI_DIAGNOSTICS") != NULL &&
 					  strcmp(getenv("OFI_DIAGNOSTICS"), "0") != 0;
 	otransport->cq_read_batch = nvmf_ofi_env_u32("OFI_CQ_READ_BATCH",
+						 strcmp(prov, "cxi") == 0 ?
+						 NVMF_OFI_CXI_CQ_READ_BATCH_DEFAULT :
 						 NVMF_OFI_CQ_READ_BATCH_DEFAULT, 1,
 						 NVMF_OFI_CQ_READ_BATCH_MAX);
 	otransport->cq_drain_batch = nvmf_ofi_env_u32("OFI_CQ_DRAIN_BATCH",
