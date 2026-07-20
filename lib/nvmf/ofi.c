@@ -3011,8 +3011,12 @@ static void
 nvmf_ofi_qpair_abort_request(struct spdk_nvmf_qpair *qpair,
 			     struct spdk_nvmf_request *req)
 {
-	/* Abort handling is not implemented by this prototype transport. */
-	SPDK_DEBUGLOG(nvmf_ofi, "qpair_abort_request is not implemented\n");
+	/* Provider operations cannot be cancelled safely until request ownership is
+	 * represented explicitly. Preserve cdw0 bit 0 (command not aborted), but
+	 * always complete the Abort command itself instead of hanging its admin qpair. */
+	SPDK_DEBUGLOG(nvmf_ofi, "abort not supported: qid=%u cid=%u\n",
+		      qpair->qid, req->cmd->nvme_cmd.cdw10_bits.abort.cid);
+	spdk_nvmf_request_complete(req);
 }
 
 static int
