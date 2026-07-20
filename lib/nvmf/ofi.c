@@ -27,6 +27,7 @@
 #include "spdk/json.h"
 
 #include "spdk_internal/trace_defs.h"
+#include "spdk_internal/ofi_wire.h"
 
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
@@ -37,7 +38,6 @@
 
 #include "nvmf_internal.h"
 #include "transport.h"
-#include "ofi_internal.h"
 
 /* -------------------------------------------------------------------------- */
 /* Defaults                                                                   */
@@ -97,41 +97,10 @@ enum spdk_nvmf_ofi_sb_state {
 	OFI_SB_EP_SETUP,	/* ADDR_EXCHANGE parsed; EP being brought up on pg thread */
 	OFI_SB_WAIT_ADDR_ACK,	/* our ADDR_EXCHANGE sent; reading ADDR_ACK */
 	OFI_SB_DONE,		/* handshake complete; qpair handed to nvmf */
-	OFI_SB_FAILED,		/* protocol/validation error or peer gone */
 };
-
-/* Upper bound on a libfabric endpoint address blob (fi_getname). SOCKADDR_IN is
- * 16 bytes, CXI is 8; 256 is generous and bounds the ADDR_EXCHANGE payload. */
-#define NVMF_OFI_MAX_EP_ADDR_LEN	256
-
-/* V1 data-path framing (design §6.1) — MUST match the host (lib/nvme/nvme_ofi.c).
- * The CID rides the CQ immediate-data field as a 64-bit tag (cid<<8 | type). */
-enum spdk_nvmf_ofi_msg_type {
-	SPDK_NVMF_OFI_MSG_SQE	= 1,	/* host->target: 64B SQE [+ WRITE data] */
-	SPDK_NVMF_OFI_MSG_CQE	= 4,	/* target->host: 16B CQE [+ READ data]  */
-};
-#define SPDK_NVMF_OFI_BUILD_TAG(cid, type)	(((uint64_t)(cid) << 8) | (uint64_t)(type))
-#define SPDK_NVMF_OFI_TAG_CID(tag)		((uint16_t)(((tag) >> 8) & 0xffff))
-
-/* V1 in-capsule data ceiling (caps a single MSG's payload). */
-#define NVMF_OFI_IN_CAPSULE_DATA_SIZE	4096
-/* V2 RMA bounce-buffer ceiling: the per-req local buffer the target fi_read's host
- * WRITE data into / fi_write's host READ data from. Bounds a single IO's transfer
- * (design max 128 KiB). Host advertises a keyed SGL; target RMAs into this buffer. */
-#define NVMF_OFI_RMA_DATA_SIZE		131072
-
-/* Private extension appended to a CXI V2 SQE.  NVMe's keyed SGL key is only
- * 32 bits, but CXI provider keys are 64-bit; the extension carries the high
- * half without changing the standard descriptor layout. */
-#define NVMF_OFI_RMA_KEY_EXT_MAGIC	0x4b49464fu
-struct nvmf_ofi_rma_key_ext {
-	uint32_t magic_le;
-	uint32_t key_hi_le;
-} __attribute__((packed));
-SPDK_STATIC_ASSERT(sizeof(struct nvmf_ofi_rma_key_ext) == 8, "RMA key extension size");
 /* Recv buffer: 64B SQE + in-capsule data. Send buffer: 16B CQE + in-capsule data. */
-#define NVMF_OFI_RECV_BUF_SIZE	(sizeof(struct spdk_nvme_cmd) + NVMF_OFI_IN_CAPSULE_DATA_SIZE)
-#define NVMF_OFI_SEND_BUF_SIZE	(sizeof(struct spdk_nvme_cpl) + NVMF_OFI_IN_CAPSULE_DATA_SIZE)
+#define NVMF_OFI_RECV_BUF_SIZE	(sizeof(struct spdk_nvme_cmd) + OFI_IN_CAPSULE_DATA_SIZE)
+#define NVMF_OFI_SEND_BUF_SIZE	(sizeof(struct spdk_nvme_cpl) + OFI_IN_CAPSULE_DATA_SIZE)
 #define NVMF_OFI_MULTI_RECV_BUF_SIZE	(64 * 1024)
 
 /* Forward declaration so create() can reference the ops table. */
@@ -157,8 +126,7 @@ struct spdk_nvmf_ofi_listener {
  *
  * Framing is non-blocking + buffer-and-advance: each readable callback pulls
  * bytes into rx_buf; once a full frame (20-byte hdr, then payload_len bytes) is
- * present we validate + dispatch. This is the prototype's blocking
- * ofi_pp_handshake target branch re-expressed for the reactor.
+ * present we validate and dispatch it.
  */
 struct spdk_nvmf_ofi_sb_conn {
 	struct spdk_sock		*sock;
@@ -176,7 +144,7 @@ struct spdk_nvmf_ofi_sb_conn {
 	uint32_t			peer_ep_addr_len;
 	char				local_ip[SPDK_NVMF_TRADDR_MAX_LEN];	/* listener IP — bind EP src to it */
 	struct spdk_nvme_transport_id	listen_trid;		/* the listener this conn arrived on */
-	uint8_t				peer_ep_addr[NVMF_OFI_MAX_EP_ADDR_LEN];
+	uint8_t				peer_ep_addr[OFI_MAX_EP_ADDR_LEN];
 
 	/* The qpair and its endpoint are created on the poll-group thread; the
 	 * acceptor thread resumes the handshake when the pg thread reports ready.
@@ -185,7 +153,7 @@ struct spdk_nvmf_ofi_sb_conn {
 	struct spdk_nvmf_ofi_qpair	*oqpair;
 	struct spdk_thread		*acceptor_thread;
 	int				ep_setup_rc;
-	uint8_t				local_ep_addr[NVMF_OFI_MAX_EP_ADDR_LEN];
+	uint8_t				local_ep_addr[OFI_MAX_EP_ADDR_LEN];
 	size_t				local_ep_addr_len;
 
 	/* Lifetime: a conn whose handshake reached DONE keeps a back-reference from
@@ -215,43 +183,12 @@ struct spdk_nvmf_ofi_sb_conn {
 /* Per-poll-group statistics (dumped via poll_group_dump_stat / the nvmf_get_stats
  * RPC). One poll group per SPDK thread; all fields touched only on that thread. */
 struct spdk_nvmf_ofi_pg_stat {
-	uint64_t	polls;			/* poll_group_poll invocations */
-	uint64_t	idle_polls;		/* polls that reaped 0 completions */
-	uint64_t	tx_cq_reads;		/* fi_cq_read calls on cq_tx */
-	uint64_t	tx_cq_empty;		/* cq_tx reads returning -FI_EAGAIN */
-	uint64_t	tx_cq_entries;		/* successful cq_tx entries consumed */
-	uint64_t	tx_cq_budget_hits;	/* polls consuming the full tx drain budget */
-	uint64_t	rx_cq_reads;		/* fi_cq_read calls on cq_rx */
-	uint64_t	rx_cq_empty;		/* cq_rx reads returning -FI_EAGAIN */
-	uint64_t	rx_cq_entries;		/* successful cq_rx entries consumed */
-	uint64_t	rx_cq_budget_hits;	/* polls consuming the full rx drain budget */
-	uint64_t	recv_cmds;		/* commands received (cq_rx) */
-	uint64_t	sent_cqes;		/* CQEs delivered (MSG + #46 folded-as-CQ-data) */
-	uint64_t	rma_reads;		/* V2 target fi_read (NVMe WRITE: pull host data) */
-	uint64_t	rma_writes;		/* V2 target fi_write/fi_writemsg (NVMe READ) */
-	uint64_t	ordered_cqes;		/* V2 READs using WRITE -> delivery-fenced SEND */
 	uint64_t	rma_eagain;		/* initial or deferred RMA issue hit -FI_EAGAIN */
 	uint64_t	send_eagain;		/* initial or deferred CQE send hit -FI_EAGAIN */
 	uint64_t	recv_eagain;		/* fi_recv attempts that hit -FI_EAGAIN */
-	uint64_t	recv_posts;		/* successful receive posts */
-	uint64_t	multi_recv_releases;	/* FI_MULTI_RECV buffers returned by provider */
 	uint64_t	no_free_reqs;		/* received commands without a free request */
 	uint64_t	cq_errors;		/* cq_tx/cq_rx -FI_EAVAIL */
 	uint64_t	recv_repost_defer;	/* recv re-posts deferred to pending_recvs */
-	/* Opt-in phase timing. Tick totals are paired with counts so analysis can
-	 * report per-request means without emitting a trace event for every I/O. */
-	uint64_t	rx_to_action_ticks;
-	uint64_t	rx_to_action_count;
-	uint64_t	exec_ticks;
-	uint64_t	exec_count;
-	uint64_t	h2c_rma_ticks;
-	uint64_t	h2c_rma_count;
-	uint64_t	c2h_rma_ticks;
-	uint64_t	c2h_rma_count;
-	uint64_t	send_completion_ticks;
-	uint64_t	send_completion_count;
-	uint64_t	request_residence_ticks;
-	uint64_t	request_residence_count;
 };
 
 struct spdk_nvmf_ofi_poll_group {
@@ -277,14 +214,13 @@ struct spdk_nvmf_ofi_transport {
 	struct fi_info				*info;		/* fi_getinfo result */
 
 	char					provider[32];	/* libfabric provider name */
-	bool					diagnostics_enabled; /* opt-in hot-path CQ counters */
 	bool					use_multi_recv;
 	bool					use_local_rma_desc;
 	bool					use_eager_direct_fill;
 	uint32_t				cq_read_batch;
 	uint32_t				cq_drain_batch;
 
-	/* #46 CQE-fold (fold the response CQE into the C2H fi_write as CQ immediate
+	/* CQE folding (carry the response CID as immediate data on the C2H write)
 	 * data) needs FI_REMOTE_CQ_DATA on an RMA write. cxi does NOT support that
 	 * (fi_writemsg+CQ_DATA -> "Flags not supported"; verified LUMI 2026-07-17),
 	 * though it DOES deliver CQ data on a fi_sendmsg (cq_data_size=8). So on cxi
@@ -292,12 +228,6 @@ struct spdk_nvmf_ofi_transport {
 	 * every other provider (verbs/tcp proven) keep the fold. See req_complete /
 	 * rma_done. */
 	bool					use_cqe_fold;
-	/* Verbs-style C2H completion: an unsignaled RMA WRITE followed by a
-	 * delivery-fenced, signaled full-CQE SEND.  CXI supports FI_FENCE but not
-	 * RMA CQ data, so this removes the intermediate successful WRITE CQE while
-	 * preserving complete NVMe response semantics. */
-	bool					use_ordered_cqe;
-
 	/* TCP sideband listeners (one per add_listener). */
 	TAILQ_HEAD(, spdk_nvmf_ofi_listener)	listeners;
 	pthread_mutex_t				lock;
@@ -321,7 +251,6 @@ struct spdk_nvmf_ofi_qpair {
 	/* libfabric endpoint, owned by group->thread. */
 	struct fid_ep				*ep;
 	fi_addr_t				peer_fi_addr;	/* AV handle for the peer */
-	bool					ep_enabled;
 	bool					mr_local;
 	bool					peer_rma_capable;
 
@@ -336,11 +265,9 @@ struct spdk_nvmf_ofi_qpair {
 	TAILQ_HEAD(, spdk_nvmf_ofi_req)	pending_send;
 	TAILQ_HEAD(, spdk_nvmf_ofi_recv_slot) pending_recvs; /* recv re-posts deferred on -FI_EAGAIN */
 	uint32_t				num_slots;	/* == queue depth */
-	bool					pools_ready;
 	bool					destroying;	/* EP closed; discard late CQ contexts */
 
 	struct spdk_nvme_transport_id		peer_trid;
-	struct spdk_nvme_transport_id		local_trid;
 	struct spdk_nvme_transport_id		listen_trid;
 
 	/* Back-ref to the sideband conn that brought this qpair up (NULL until the
@@ -373,19 +300,16 @@ enum spdk_nvmf_ofi_req_state {
 	OFI_REQ_RMA_WRITE_IN_FLIGHT,
 	OFI_REQ_SEND_PENDING,
 	OFI_REQ_SEND_IN_FLIGHT,
-	OFI_REQ_ORDERED_SEND_PENDING,
-	OFI_REQ_ORDERED_CHAIN_IN_FLIGHT,
 	OFI_REQ_RELEASING,
 };
 
 enum spdk_nvmf_ofi_completion_mode {
 	OFI_COMPLETION_SPLIT = 0,
 	OFI_COMPLETION_FOLDED,
-	OFI_COMPLETION_ORDERED,
 };
 
 SPDK_STATIC_ASSERT(OFI_REQ_RELEASING <= UINT8_MAX, "OFI request state storage type");
-SPDK_STATIC_ASSERT(OFI_COMPLETION_ORDERED <= UINT8_MAX, "OFI completion mode storage type");
+SPDK_STATIC_ASSERT(OFI_COMPLETION_FOLDED <= UINT8_MAX, "OFI completion mode storage type");
 
 /*
  * A transport request: embeds the core's spdk_nvmf_request plus the storage for
@@ -415,46 +339,18 @@ struct spdk_nvmf_ofi_req {
 	uint64_t				rma_addr;	/* host buffer addr (vaddr or offset) */
 	uint64_t				rma_key;	/* host MR key */
 	uint32_t				cqe_len;	/* CQE capsule length for a deferred send */
-	uint64_t				diag_receive_tsc;
-	uint64_t				diag_rma_tsc;
-	uint64_t				diag_exec_tsc;
-	uint64_t				diag_send_tsc;
-	bool					diag_first_action_recorded;
 	TAILQ_ENTRY(spdk_nvmf_ofi_req)		link;
+	/* Keep consecutive request objects from using a power-of-two cache-set stride. */
+	uint8_t				cache_set_padding[8];
 };
 
-static inline bool
-nvmf_ofi_req_diagnostics_enabled(const struct spdk_nvmf_ofi_req *oreq)
-{
-	/* Admin AERs can remain outstanding for the entire benchmark window. Mixing
-	 * their lifetime into data-path phase means makes the apparent per-I/O
-	 * residence inversely proportional to workload IOPS. */
-	return oreq->oqpair->transport->diagnostics_enabled && oreq->oqpair->qpair.qid != 0;
-}
-
-static inline void
-nvmf_ofi_diag_first_action(struct spdk_nvmf_ofi_req *oreq)
-{
-	struct spdk_nvmf_ofi_pg_stat *stat;
-
-	if (!nvmf_ofi_req_diagnostics_enabled(oreq) || oreq->diag_first_action_recorded ||
-	    oreq->diag_receive_tsc == 0) {
-		return;
-	}
-	stat = &oreq->oqpair->group->stat;
-	stat->rx_to_action_ticks += spdk_get_ticks() - oreq->diag_receive_tsc;
-	stat->rx_to_action_count++;
-	oreq->diag_first_action_recorded = true;
-}
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_ofi_req) % SPDK_CACHE_LINE_SIZE != 0,
+		   "OFI request array stride must spread cache-set indices");
 
 static inline void
 nvmf_ofi_request_exec(struct spdk_nvmf_ofi_req *oreq)
 {
 	assert(oreq->state == OFI_REQ_RECEIVED);
-	nvmf_ofi_diag_first_action(oreq);
-	if (nvmf_ofi_req_diagnostics_enabled(oreq)) {
-		oreq->diag_exec_tsc = spdk_get_ticks();
-	}
 	oreq->state = OFI_REQ_EXECUTING;
 	spdk_nvmf_request_exec(&oreq->req);
 }
@@ -481,7 +377,7 @@ nvmf_ofi_qpair_uses_multi_recv(const struct spdk_nvmf_ofi_qpair *oqpair)
  * filter.
  */
 static int
-nvmf_ofi_getinfo(const char *prov, bool require_fence, struct fi_info **out_info)
+nvmf_ofi_getinfo(const char *prov, struct fi_info **out_info)
 {
 	struct fi_info *hints, *info, *i;
 	int rc;
@@ -499,9 +395,7 @@ nvmf_ofi_getinfo(const char *prov, bool require_fence, struct fi_info **out_info
 	hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
 	hints->tx_attr->msg_order = FI_ORDER_SAS;
 	hints->rx_attr->msg_order = FI_ORDER_SAS;
-	/* Ordered completion uses FI_SELECTIVE_COMPLETION and opts successful
-	 * operations into CQ reporting individually. */
-	hints->tx_attr->op_flags = require_fence ? 0 : FI_COMPLETION;
+	hints->tx_attr->op_flags = FI_COMPLETION;
 	hints->rx_attr->op_flags = FI_COMPLETION;
 
 	if (strcmp(prov, "cxi") == 0) {
@@ -512,9 +406,6 @@ nvmf_ofi_getinfo(const char *prov, bool require_fence, struct fi_info **out_info
 		 * not rely on cross-message ordering. The V2 CQE-fold path that used
 		 * FI_REMOTE_CQ_DATA as an *op flag* is re-evaluated separately for CXI. */
 		hints->caps = FI_MSG | FI_RMA | FI_READ | FI_WRITE;
-		if (require_fence) {
-			hints->caps |= FI_FENCE;
-		}
 		hints->addr_format = FI_ADDR_CXI;
 		hints->domain_attr->mr_mode = FI_MR_PROV_KEY | FI_MR_ALLOCATED | FI_MR_ENDPOINT;
 		hints->tx_attr->msg_order = 0;	/* cxi tx offers no ordering; override SAS set above */
@@ -683,7 +574,6 @@ nvmf_ofi_create(struct spdk_nvmf_transport_opts *opts)
 {
 	struct spdk_nvmf_ofi_transport *otransport;
 	const char *prov;
-	bool ordered_requested;
 	int rc;
 
 	otransport = calloc(1, sizeof(*otransport));
@@ -703,19 +593,14 @@ nvmf_ofi_create(struct spdk_nvmf_transport_opts *opts)
 		prov = NVMF_OFI_DEFAULT_PROVIDER;
 	}
 	snprintf(otransport->provider, sizeof(otransport->provider), "%s", prov);
-	/* CXI's scalable fast path is the default. Setting either knob to 0 keeps a
+	/* CXI's scalable fast path is the default. Setting a knob to 0 keeps a
 	 * provider-cache fallback for diagnostics and older deployments. */
 	otransport->use_multi_recv = strcmp(prov, "cxi") == 0 &&
-				    (getenv("OFI_CXI_MULTI_RECV") == NULL ||
-				     strcmp(getenv("OFI_CXI_MULTI_RECV"), "0") != 0);
+				    nvmf_ofi_env_enabled("OFI_CXI_MULTI_RECV", true);
 	otransport->use_local_rma_desc = strcmp(prov, "cxi") == 0 &&
-					(getenv("OFI_CXI_LOCAL_RMA_DESC") == NULL ||
-					 strcmp(getenv("OFI_CXI_LOCAL_RMA_DESC"), "0") != 0);
+					nvmf_ofi_env_enabled("OFI_CXI_LOCAL_RMA_DESC", true);
 	otransport->use_eager_direct_fill = strcmp(prov, "cxi") == 0 &&
-					      (getenv("OFI_EAGER_DIRECT_FILL") == NULL ||
-					       strcmp(getenv("OFI_EAGER_DIRECT_FILL"), "0") != 0);
-	otransport->diagnostics_enabled = getenv("OFI_DIAGNOSTICS") != NULL &&
-					  strcmp(getenv("OFI_DIAGNOSTICS"), "0") != 0;
+					      nvmf_ofi_env_enabled("OFI_EAGER_DIRECT_FILL", true);
 	otransport->cq_read_batch = nvmf_ofi_env_u32("OFI_CQ_READ_BATCH",
 						 strcmp(prov, "cxi") == 0 ?
 						 NVMF_OFI_CXI_CQ_READ_BATCH_DEFAULT :
@@ -725,26 +610,15 @@ nvmf_ofi_create(struct spdk_nvmf_transport_opts *opts)
 						  NVMF_OFI_CQ_DRAIN_BATCH_DEFAULT,
 						  otransport->cq_read_batch,
 						  NVMF_OFI_CQ_DRAIN_BATCH_MAX);
-	ordered_requested = strcmp(prov, "cxi") == 0 &&
-			    nvmf_ofi_env_enabled("OFI_CXI_ORDERED_CQE", false);
-
 	/* Runtime-adaptive fi_getinfo + per-transport fabric. */
-	rc = nvmf_ofi_getinfo(otransport->provider, ordered_requested, &otransport->info);
-	if (rc != 0 && ordered_requested) {
-		SPDK_WARNLOG("OFI provider '%s' cannot satisfy FI_FENCE; using split READ completion\n",
-			     otransport->provider);
-		ordered_requested = false;
-		rc = nvmf_ofi_getinfo(otransport->provider, false, &otransport->info);
-	}
+	rc = nvmf_ofi_getinfo(otransport->provider, &otransport->info);
 	if (rc != 0) {
 		SPDK_ERRLOG("OFI transport create: getinfo failed for provider '%s'\n", otransport->provider);
 		goto err_info;
 	}
 
-	/* #46 fold is available everywhere except cxi (no RMA+CQ data on cxi). */
+	/* CQE folding is available everywhere except CXI (no RMA+CQ data on CXI). */
 	otransport->use_cqe_fold = (strcmp(otransport->provider, "cxi") != 0);
-	otransport->use_ordered_cqe = ordered_requested &&
-				      (otransport->info->caps & FI_FENCE) != 0;
 
 	rc = fi_fabric(otransport->info->fabric_attr, &otransport->fabric, NULL);
 	if (rc != 0) {
@@ -767,14 +641,13 @@ nvmf_ofi_create(struct spdk_nvmf_transport_opts *opts)
 	}
 
 	SPDK_NOTICELOG("OFI transport initialized: provider=%s addr_format=%s cq_read=%u cq_drain=%u "
-		       "multi_recv=%d local_rma_desc=%d eager_direct_fill=%d ordered_cqe=%d\n",
+		       "multi_recv=%d local_rma_desc=%d eager_direct_fill=%d\n",
 		       otransport->provider,
 		       otransport->info->addr_format == FI_ADDR_CXI ? "CXI" : "SOCKADDR",
 		       otransport->cq_read_batch, otransport->cq_drain_batch,
 		       otransport->use_multi_recv,
 		       otransport->use_local_rma_desc,
-		       otransport->use_eager_direct_fill,
-		       otransport->use_ordered_cqe);
+		       otransport->use_eager_direct_fill);
 	SPDK_INFOLOG(nvmf_ofi, "OFI transport: provider=%s caps=0x%lx mr_mode=0x%lx\n",
 		     otransport->provider,
 		     (unsigned long)otransport->info->caps,
@@ -1043,6 +916,37 @@ nvmf_ofi_sb_send_status(struct spdk_nvmf_ofi_sb_conn *conn, uint16_t msg_type,
 	return nvmf_ofi_sb_send(conn, &hdr, NULL, 0);
 }
 
+static int
+nvmf_ofi_sb_hello_validate(const struct ofi_sb_hello *hello, const char **errstr)
+{
+#define REJECT(reason) do { \
+		if (errstr != NULL) { *errstr = reason; } \
+		SPDK_WARNLOG("sideband HELLO: %s\n", reason); \
+		return -EINVAL; \
+	} while (0)
+
+	if (hello->hostnqn[sizeof(hello->hostnqn) - 1] != '\0') {
+		REJECT("hostnqn not NUL-terminated");
+	}
+	if (hello->subnqn[sizeof(hello->subnqn) - 1] != '\0') {
+		REJECT("subnqn not NUL-terminated");
+	}
+	if (hello->host_provider[sizeof(hello->host_provider) - 1] != '\0') {
+		REJECT("host_provider not NUL-terminated");
+	}
+	if (ofi_le32_to_cpu(hello->max_io_size_le) == 0) {
+		REJECT("max_io_size == 0");
+	}
+	if (ofi_le32_to_cpu(hello->io_unit_size_le) == 0) {
+		REJECT("io_unit_size == 0");
+	}
+	if (ofi_le32_to_cpu(hello->in_capsule_data_size_le) == 0) {
+		REJECT("in_capsule_data_size == 0");
+	}
+#undef REJECT
+	return 0;
+}
+
 /* -------------------------------------------------------------------------- */
 /* EP bring-up: cross-thread (acceptor thread <-> pg thread) — design §3.4/§3.5 */
 /* -------------------------------------------------------------------------- */
@@ -1234,9 +1138,7 @@ nvmf_ofi_ep_setup_on_pg(void *ctx)
 		SPDK_ERRLOG("fi_ep_bind(av) failed: %s\n", fi_strerror(-rc));
 		goto out;
 	}
-	rc = fi_ep_bind(oqpair->ep, &pg->cq_tx->fid,
-			otransport->use_ordered_cqe ?
-			FI_TRANSMIT | FI_SELECTIVE_COMPLETION : FI_TRANSMIT);
+	rc = fi_ep_bind(oqpair->ep, &pg->cq_tx->fid, FI_TRANSMIT);
 	if (rc != 0) {
 		SPDK_ERRLOG("fi_ep_bind(cq_tx) failed: %s\n", fi_strerror(-rc));
 		goto out;
@@ -1252,8 +1154,6 @@ nvmf_ofi_ep_setup_on_pg(void *ctx)
 		SPDK_ERRLOG("fi_enable failed: %s\n", fi_strerror(-rc));
 		goto out;
 	}
-	oqpair->ep_enabled = true;
-
 	/* fi_getname only valid after enable (CXI allocates the PID in enable). */
 	addrlen = sizeof(conn->local_ep_addr);
 	rc = fi_getname(&oqpair->ep->fid, conn->local_ep_addr, &addrlen);
@@ -1302,7 +1202,7 @@ nvmf_ofi_ep_ready(void *ctx)
 {
 	struct spdk_nvmf_ofi_sb_conn *conn = ctx;
 	struct spdk_nvmf_ofi_transport *otransport = conn->transport;
-	uint8_t buf[sizeof(struct ofi_sb_addr) + NVMF_OFI_MAX_EP_ADDR_LEN];
+	uint8_t buf[sizeof(struct ofi_sb_addr) + OFI_MAX_EP_ADDR_LEN];
 	struct ofi_sb_addr *a = (struct ofi_sb_addr *)buf;
 	struct ofi_sb_hdr hdr;
 	uint32_t plen;
@@ -1364,7 +1264,7 @@ nvmf_ofi_sb_handle_frame(struct spdk_nvmf_ofi_sb_conn *conn,
 			nvmf_ofi_sb_send_status(conn, OFI_SB_ERROR, OFI_SB_STAT_EINVAL);
 			return -EPROTO;
 		}
-		if (ofi_sb_hello_validate(hello, &err) != 0) {
+		if (nvmf_ofi_sb_hello_validate(hello, &err) != 0) {
 			SPDK_WARNLOG("sideband: HELLO rejected (%s)\n", err ? err : "?");
 			nvmf_ofi_sb_send_status(conn, OFI_SB_HELLO_ACK, OFI_SB_STAT_EINVAL);
 			return -EINVAL;
@@ -1466,7 +1366,6 @@ nvmf_ofi_sb_handle_frame(struct spdk_nvmf_ofi_sb_conn *conn,
 		 * local EP/data path uses a different ephemeral port and is irrelevant
 		 * to NVMe-oF addressing. */
 		oqpair->listen_trid = conn->listen_trid;
-		oqpair->local_trid = conn->listen_trid;
 
 		/* Hand the qpair to nvmf, but keep the sideband↔qpair link alive: the
 		 * conn holds oqpair, and oqpair holds a back-ref to conn (refcount 2 —
@@ -1629,14 +1528,6 @@ nvmf_ofi_accept(void *ctx)
 /* -------------------------------------------------------------------------- */
 
 static void
-nvmf_ofi_cdata_init(struct spdk_nvmf_transport *transport,
-		    struct spdk_nvmf_subsystem *subsystem,
-		    struct spdk_nvmf_ctrlr_data *cdata)
-{
-	/* Keep the core defaults; OFI has no additional controller-data fields. */
-}
-
-static void
 nvmf_ofi_listener_discover(struct spdk_nvmf_transport *transport,
 			   struct spdk_nvme_transport_id *trid,
 			   struct spdk_nvmf_discovery_log_page_entry *entry)
@@ -1656,8 +1547,7 @@ nvmf_ofi_listener_discover(struct spdk_nvmf_transport *transport,
 /*
  * Runs on the pg's SPDK thread. Bring up the per-thread libfabric domain + the
  * shared AV + the dual CQ (tx/rx) that every qpair's EP on this thread binds to.
- * FI_AV_MAP / FI_CQ_FORMAT_DATA mirror the prototype (design §3.5.1/§3.5.2): the
- * CQ data field carries the 64-bit V1 tag.
+ * FI_AV_MAP and FI_CQ_FORMAT_DATA let the CQ data field carry the 64-bit tag.
  */
 static struct spdk_nvmf_transport_poll_group *
 nvmf_ofi_poll_group_create(struct spdk_nvmf_transport *transport,
@@ -1814,7 +1704,6 @@ nvmf_ofi_post_recv(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_recv
 		return (int)rc;
 	}
 	slot->posted = true;
-	oqpair->group->stat.recv_posts++;
 	return 0;
 }
 
@@ -1835,9 +1724,7 @@ static void nvmf_ofi_send_cqe(struct spdk_nvmf_ofi_req *oreq, uint32_t send_len)
 static void nvmf_ofi_req_release(struct spdk_nvmf_ofi_req *req);
 static void nvmf_ofi_req_complete(struct spdk_nvmf_request *req);
 
-/* Raw RMA issue.  Message forms are used so completion flags are explicit:
- * ordered C2H writes suppress their successful CQ entry, while H2C reads,
- * split writes, and folded writes request one. */
+/* Raw RMA issue. Message forms keep the folded-write CQ data explicit. */
 static ssize_t
 nvmf_ofi_issue_rma(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_req *oreq)
 {
@@ -1865,19 +1752,16 @@ nvmf_ofi_issue_rma(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_req 
 		return fi_readmsg(oqpair->ep, &msg, flags);
 	}
 	if (oreq->completion_mode == OFI_COMPLETION_FOLDED) {
-		/* #46: fold the response CQE into the write as CQ immediate data (the
+		/* Fold the response CQE into the write as CQ immediate data (the
 		 * CID tag). The host completes on this single write completion — no
 		 * separate CQE MSG (saving a message, a send slot, a completion, and a
 		 * host recv slot on every READ). Success is implied; any error takes
 		 * the separate-CQE path in req_complete. RC TRANSMIT_COMPLETE (the
-		 * local completion below) ⇒ data delivered to host memory (p0b), and
+		 * local completion below) means data is delivered to host memory, and
 		 * the remote CQ data lands with it. */
 		struct spdk_nvme_cpl *rsp = &oreq->rsp_storage.nvme_cpl;
-		msg.data = SPDK_NVMF_OFI_BUILD_TAG(rsp->cid, SPDK_NVMF_OFI_MSG_CQE);
+		msg.data = OFI_BUILD_TAG(rsp->cid, OFI_MSG_CQE);
 		return fi_writemsg(oqpair->ep, &msg, FI_REMOTE_CQ_DATA | FI_COMPLETION);
-	}
-	if (oreq->completion_mode == OFI_COMPLETION_ORDERED) {
-		flags = 0;
 	}
 	return fi_writemsg(oqpair->ep, &msg, flags);
 }
@@ -1896,15 +1780,12 @@ nvmf_ofi_post_rma(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_req *
 {
 	ssize_t rc;
 
-	nvmf_ofi_diag_first_action(oreq);
 	oreq->completion_mode = OFI_COMPLETION_SPLIT;
 	oreq->state = is_read ? OFI_REQ_RMA_READ_PENDING : OFI_REQ_RMA_WRITE_PENDING;
 	if (is_read) {
-		oqpair->group->stat.rma_reads++;
 		spdk_trace_record(TRACE_OFI_RMA_READ, oqpair->qpair.trace_id, 0,
 				  (uintptr_t)oreq, oreq->req.length);
 	} else {
-		oqpair->group->stat.rma_writes++;
 		spdk_trace_record(TRACE_OFI_RMA_WRITE, oqpair->qpair.trace_id, 0,
 				  (uintptr_t)oreq, oreq->req.length);
 	}
@@ -1921,13 +1802,10 @@ nvmf_ofi_post_rma(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_req *
 		return (int)rc;
 	}
 	oreq->state = is_read ? OFI_REQ_RMA_READ_IN_FLIGHT : OFI_REQ_RMA_WRITE_IN_FLIGHT;
-	if (nvmf_ofi_req_diagnostics_enabled(oreq)) {
-		oreq->diag_rma_tsc = spdk_get_ticks();
-	}
 	return 0;
 }
 
-/* #46: post a C2H write that folds the CQE as CQ immediate data — one operation
+/* Post a C2H write that folds the CQE as CQ immediate data. One operation
  * delivers the read data AND the completion to the host, replacing the old
  * fi_write + fi_sendmsg(CQE) pair. Defers to pending_rma on -FI_EAGAIN like
  * post_rma; the deferred retry re-issues as a writemsg-with-CQE because the
@@ -1939,7 +1817,6 @@ nvmf_ofi_post_rma_cqe(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_r
 
 	oreq->completion_mode = OFI_COMPLETION_FOLDED;
 	oreq->state = OFI_REQ_RMA_WRITE_PENDING;
-	oqpair->group->stat.rma_writes++;	/* #46: the fold write delivers the CQE */
 	spdk_trace_record(TRACE_OFI_RMA_WRITE, oqpair->qpair.trace_id, 0,
 			  (uintptr_t)oreq, oreq->req.length);
 	rc = nvmf_ofi_issue_rma(oqpair, oreq);
@@ -1954,9 +1831,6 @@ nvmf_ofi_post_rma_cqe(struct spdk_nvmf_ofi_qpair *oqpair, struct spdk_nvmf_ofi_r
 		return (int)rc;
 	}
 	oreq->state = OFI_REQ_RMA_WRITE_IN_FLIGHT;
-	if (nvmf_ofi_req_diagnostics_enabled(oreq)) {
-		oreq->diag_rma_tsc = spdk_get_ticks();
-	}
 	return 0;
 }
 
@@ -1968,19 +1842,6 @@ nvmf_ofi_rma_done(struct spdk_nvmf_ofi_req *oreq)
 	bool is_read = oreq->state == OFI_REQ_RMA_READ_IN_FLIGHT;
 
 	assert(is_read || oreq->state == OFI_REQ_RMA_WRITE_IN_FLIGHT);
-	if (nvmf_ofi_req_diagnostics_enabled(oreq) && oreq->diag_rma_tsc != 0) {
-		struct spdk_nvmf_ofi_pg_stat *stat = &oreq->oqpair->group->stat;
-		uint64_t elapsed = spdk_get_ticks() - oreq->diag_rma_tsc;
-
-		if (is_read) {
-			stat->h2c_rma_ticks += elapsed;
-			stat->h2c_rma_count++;
-		} else {
-			stat->c2h_rma_ticks += elapsed;
-			stat->c2h_rma_count++;
-		}
-		oreq->diag_rma_tsc = 0;
-	}
 	if (is_read) {
 		oreq->state = OFI_REQ_RECEIVED;
 		nvmf_ofi_request_exec(oreq);
@@ -1988,7 +1849,7 @@ nvmf_ofi_rma_done(struct spdk_nvmf_ofi_req *oreq)
 		/* C2H write done. */
 		oreq->state = OFI_REQ_EXECUTING;
 		if (oreq->completion_mode == OFI_COMPLETION_FOLDED) {
-			/* #46 fold: the CQE was folded into this write as CQ immediate data,
+			/* The CQE was folded into this write as CQ immediate data,
 			 * so it is already delivered to the host — no separate CQE to send.
 			 * Recycle the req. */
 			nvmf_ofi_req_release(oreq);
@@ -2002,66 +1863,6 @@ nvmf_ofi_rma_done(struct spdk_nvmf_ofi_req *oreq)
 }
 
 static ssize_t nvmf_ofi_issue_send(struct spdk_nvmf_ofi_req *oreq, uint32_t send_len);
-
-/* Continue an ordered C2H completion after its unsignaled WRITE was accepted. */
-static void
-nvmf_ofi_ordered_send_after_write(struct spdk_nvmf_ofi_req *oreq)
-{
-	ssize_t rc;
-
-	assert(oreq->completion_mode == OFI_COMPLETION_ORDERED);
-	oreq->cqe_len = sizeof(struct spdk_nvme_cpl);
-	oreq->state = OFI_REQ_ORDERED_SEND_PENDING;
-	rc = nvmf_ofi_issue_send(oreq, oreq->cqe_len);
-	if (rc == -FI_EAGAIN) {
-		oreq->oqpair->group->stat.send_eagain++;
-		TAILQ_INSERT_TAIL(&oreq->oqpair->pending_send, oreq, link);
-		return;
-	}
-	if (rc != 0) {
-		/* The WRITE was already accepted and has no standalone success CQE.
-		 * Reissuing or recycling its buffers is unsafe; disconnect flushes the
-		 * endpoint and lets the core fail all in-flight requests. */
-		SPDK_ERRLOG("ofi target: ordered CQE fi_sendmsg: %s; disconnecting qpair\n",
-			    fi_strerror(-(int)rc));
-		spdk_nvmf_qpair_disconnect(&oreq->oqpair->qpair);
-		return;
-	}
-	oreq->state = OFI_REQ_ORDERED_CHAIN_IN_FLIGHT;
-	if (nvmf_ofi_req_diagnostics_enabled(oreq)) {
-		oreq->diag_send_tsc = spdk_get_ticks();
-	}
-}
-
-/* Submit the verbs-style WRITE -> fenced full-CQE SEND pair.  If the WRITE
- * cannot be accepted yet, pending_rma retries the pair from its first step. */
-static void
-nvmf_ofi_post_ordered_cqe(struct spdk_nvmf_ofi_req *oreq)
-{
-	struct spdk_nvmf_ofi_qpair *oqpair = oreq->oqpair;
-	ssize_t rc;
-
-	oreq->completion_mode = OFI_COMPLETION_ORDERED;
-	oreq->state = OFI_REQ_RMA_WRITE_PENDING;
-	oqpair->group->stat.rma_writes++;
-	oqpair->group->stat.ordered_cqes++;
-	spdk_trace_record(TRACE_OFI_RMA_WRITE, oqpair->qpair.trace_id, 0,
-			  (uintptr_t)oreq, oreq->req.length);
-	rc = nvmf_ofi_issue_rma(oqpair, oreq);
-	if (rc == -FI_EAGAIN) {
-		oqpair->group->stat.rma_eagain++;
-		TAILQ_INSERT_TAIL(&oqpair->pending_rma, oreq, link);
-		return;
-	}
-	if (rc != 0) {
-		SPDK_ERRLOG("ofi target: ordered data fi_writemsg: %s; disconnecting qpair\n",
-			    fi_strerror(-(int)rc));
-		oreq->state = OFI_REQ_RELEASING;
-		spdk_nvmf_qpair_disconnect(&oqpair->qpair);
-		return;
-	}
-	nvmf_ofi_ordered_send_after_write(oreq);
-}
 
 /* Retry RMAs / CQE sends deferred on a full TX queue. Stops at the first
  * still-EAGAIN op (queue still full) — order is preserved, and the next poll
@@ -2087,26 +1888,12 @@ nvmf_ofi_drain_pending_rma(struct spdk_nvmf_ofi_poll_group *opgroup)
 				SPDK_ERRLOG("ofi target: deferred fi_%s: %s\n",
 					    is_read ? "read" : "write",
 					    fi_strerror(-(int)rc));
-				if (oreq->completion_mode == OFI_COMPLETION_ORDERED) {
-					oreq->state = OFI_REQ_RELEASING;
-					spdk_nvmf_qpair_disconnect(&oqpair->qpair);
-				} else {
-					nvmf_ofi_req_release(oreq);
-				}
+				nvmf_ofi_req_release(oreq);
 			} else {
-				if (oreq->completion_mode == OFI_COMPLETION_ORDERED) {
-					nvmf_ofi_ordered_send_after_write(oreq);
-				} else {
-					oreq->state = is_read ? OFI_REQ_RMA_READ_IN_FLIGHT :
+				oreq->state = is_read ? OFI_REQ_RMA_READ_IN_FLIGHT :
 						      OFI_REQ_RMA_WRITE_IN_FLIGHT;
-				}
-				if (nvmf_ofi_req_diagnostics_enabled(oreq) &&
-				    oreq->completion_mode != OFI_COMPLETION_ORDERED) {
-					oreq->diag_rma_tsc = spdk_get_ticks();
-				}
 			}
-			/* Normal success completes later via cq_tx (FI_READ/FI_WRITE).
-			 * Ordered success is retired by the final FI_SEND completion. */
+			/* Success completes later via cq_tx (FI_READ/FI_WRITE). */
 		}
 	}
 }
@@ -2118,8 +1905,7 @@ nvmf_ofi_issue_send(struct spdk_nvmf_ofi_req *oreq, uint32_t send_len)
 {
 	struct spdk_nvmf_ofi_qpair *oqpair = oreq->oqpair;
 	struct spdk_nvme_cpl *rsp = &oreq->rsp_storage.nvme_cpl;
-	uint64_t tag = SPDK_NVMF_OFI_BUILD_TAG(rsp->cid, SPDK_NVMF_OFI_MSG_CQE);
-	uint64_t flags = FI_REMOTE_CQ_DATA | FI_COMPLETION;
+	uint64_t tag = OFI_BUILD_TAG(rsp->cid, OFI_MSG_CQE);
 	struct iovec iov;
 	struct fi_msg msg = {0};
 
@@ -2131,12 +1917,7 @@ nvmf_ofi_issue_send(struct spdk_nvmf_ofi_req *oreq, uint32_t send_len)
 	msg.addr = oqpair->peer_fi_addr;
 	msg.context = oreq;
 	msg.data = tag;
-	if (oreq->completion_mode == OFI_COMPLETION_ORDERED) {
-		/* The full CQE SEND is deferred until the preceding unsignaled WRITE
-		 * reaches target-process visibility.  Its completion retires both. */
-		flags |= FI_FENCE | FI_DELIVERY_COMPLETE;
-	}
-	return fi_sendmsg(oqpair->ep, &msg, flags);
+	return fi_sendmsg(oqpair->ep, &msg, FI_REMOTE_CQ_DATA | FI_COMPLETION);
 }
 
 static void
@@ -2148,10 +1929,9 @@ nvmf_ofi_drain_pending_send(struct spdk_nvmf_ofi_poll_group *opgroup)
 		struct spdk_nvmf_ofi_req *oreq;
 
 		while ((oreq = TAILQ_FIRST(&oqpair->pending_send)) != NULL) {
-			bool ordered = oreq->state == OFI_REQ_ORDERED_SEND_PENDING;
 			ssize_t rc = nvmf_ofi_issue_send(oreq, oreq->cqe_len);
 
-			assert(ordered || oreq->state == OFI_REQ_SEND_PENDING);
+			assert(oreq->state == OFI_REQ_SEND_PENDING);
 			if (rc == -FI_EAGAIN) {
 				opgroup->stat.send_eagain++;
 				break;
@@ -2160,18 +1940,9 @@ nvmf_ofi_drain_pending_send(struct spdk_nvmf_ofi_poll_group *opgroup)
 			if (rc != 0) {
 				SPDK_ERRLOG("ofi target: deferred response fi_sendmsg: %s\n",
 					    fi_strerror(-(int)rc));
-				if (ordered) {
-					/* Its unsignaled data WRITE was already accepted. */
-					spdk_nvmf_qpair_disconnect(&oqpair->qpair);
-				} else {
-					nvmf_ofi_req_release(oreq);
-				}
+				nvmf_ofi_req_release(oreq);
 			} else {
-				oreq->state = ordered ? OFI_REQ_ORDERED_CHAIN_IN_FLIGHT :
-					      OFI_REQ_SEND_IN_FLIGHT;
-				if (nvmf_ofi_req_diagnostics_enabled(oreq)) {
-					oreq->diag_send_tsc = spdk_get_ticks();
-				}
+				oreq->state = OFI_REQ_SEND_IN_FLIGHT;
 			}
 		}
 	}
@@ -2215,11 +1986,6 @@ nvmf_ofi_req_get(struct spdk_nvmf_ofi_qpair *oqpair)
 	req->state = OFI_REQ_RECEIVED;
 	req->completion_mode = OFI_COMPLETION_SPLIT;
 	req->use_rma = false;
-	req->diag_receive_tsc = 0;
-	req->diag_rma_tsc = 0;
-	req->diag_exec_tsc = 0;
-	req->diag_send_tsc = 0;
-	req->diag_first_action_recorded = false;
 	return req;
 }
 
@@ -2231,13 +1997,6 @@ nvmf_ofi_req_release(struct spdk_nvmf_ofi_req *req)
 	struct spdk_nvmf_ofi_qpair *oqpair = req->oqpair;
 
 	assert(req->state != OFI_REQ_FREE);
-	if (nvmf_ofi_req_diagnostics_enabled(req) && req->diag_receive_tsc != 0) {
-		oqpair->group->stat.request_residence_ticks +=
-			spdk_get_ticks() - req->diag_receive_tsc;
-		oqpair->group->stat.request_residence_count++;
-		req->diag_receive_tsc = 0;
-	}
-
 	/* During two-phase teardown the EP is already closed, but its shared CQ can
 	 * still contain send/RMA completions. Do not re-post a receive to the closed
 	 * endpoint; the entire pool remains alive until those late contexts drain. */
@@ -2279,7 +2038,6 @@ nvmf_ofi_qpair_free_pools(struct spdk_nvmf_ofi_qpair *oqpair)
 	free(oqpair->reqs);
 	oqpair->recv_slots = NULL;
 	oqpair->reqs = NULL;
-	oqpair->pools_ready = false;
 }
 
 /* C2H data length from the command's SGL descriptor, clamped to the in-capsule
@@ -2289,7 +2047,7 @@ nvmf_ofi_qpair_free_pools(struct spdk_nvmf_ofi_qpair *oqpair)
 static uint32_t
 nvmf_ofi_cmd_data_len(const union nvmf_h2c_msg *cmd)
 {
-	return spdk_min(cmd->nvme_cmd.dptr.sgl1.unkeyed.length, NVMF_OFI_IN_CAPSULE_DATA_SIZE);
+	return spdk_min(cmd->nvme_cmd.dptr.sgl1.unkeyed.length, OFI_IN_CAPSULE_DATA_SIZE);
 }
 
 static int
@@ -2337,7 +2095,7 @@ nvmf_ofi_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 		 * initiator), so it is sized to the RMA ceiling and registered FI_READ|
 		 * FI_WRITE — FI_READ so fi_read can land into it, FI_WRITE so fi_write can
 		 * source from it. */
-		rq->data_buf = spdk_zmalloc(NVMF_OFI_RMA_DATA_SIZE, 0, NULL,
+		rq->data_buf = spdk_zmalloc(OFI_RMA_DATA_SIZE, 0, NULL,
 					    SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 		if (rs->buf == NULL || rq->send_buf == NULL || rq->data_buf == NULL) {
 			rc = -ENOMEM;
@@ -2356,7 +2114,7 @@ nvmf_ofi_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 				SPDK_ERRLOG("ofi target: fi_mr_reg(send): %s\n", fi_strerror(-rc));
 				goto err;
 			}
-			rc = fi_mr_reg(opgroup->domain, rq->data_buf, NVMF_OFI_RMA_DATA_SIZE,
+			rc = fi_mr_reg(opgroup->domain, rq->data_buf, OFI_RMA_DATA_SIZE,
 				       FI_READ | FI_WRITE, 0, 0, 0, &rq->data_mr, NULL);
 			if (rc != 0) {
 				SPDK_ERRLOG("ofi target: fi_mr_reg(data): %s\n", fi_strerror(-rc));
@@ -2371,7 +2129,7 @@ nvmf_ofi_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 			/* FI_MR_LOCAL is not required by CXI, but libfabric 1.22 permits an
 			 * application-managed descriptor. This avoids a provider MR-cache
 			 * lookup and deletion for every target-initiated RMA. */
-			rc = fi_mr_reg(opgroup->domain, rq->data_buf, NVMF_OFI_RMA_DATA_SIZE,
+			rc = fi_mr_reg(opgroup->domain, rq->data_buf, OFI_RMA_DATA_SIZE,
 				       access, 0, 0, 0, &rq->data_mr, NULL);
 			if (rc != 0) {
 				SPDK_ERRLOG("ofi target: fi_mr_reg(local data): %s\n", fi_strerror(-rc));
@@ -2401,8 +2159,6 @@ nvmf_ofi_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 			goto err;
 		}
 	}
-	oqpair->pools_ready = true;
-
 	TAILQ_INSERT_TAIL(&opgroup->qpairs, oqpair, link);
 	{
 		char owner[64];
@@ -2455,9 +2211,6 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	struct fi_cq_err_entry err;
 	uint32_t reaped = 0, batch;
 	ssize_t rc, k;
-	bool diagnostics_enabled = opgroup->transport->diagnostics_enabled;
-
-	opgroup->stat.polls++;
 
 	/* Re-post recv slots whose re-post was deferred on -FI_EAGAIN, before
 	 * draining — so they can receive the commands we are about to pull. */
@@ -2473,13 +2226,7 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 					 opgroup->transport->cq_drain_batch - batch);
 
 		rc = fi_cq_read(opgroup->cq_tx, entries, want);
-		if (diagnostics_enabled) {
-			opgroup->stat.tx_cq_reads++;
-		}
 		if (rc == -FI_EAGAIN) {
-			if (diagnostics_enabled) {
-				opgroup->stat.tx_cq_empty++;
-			}
 			break;
 		}
 		if (rc == -FI_EAVAIL) {
@@ -2490,11 +2237,10 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			/* A TX completion errored (a V2 fi_read/fi_write, or a response send).
 			 * The fabric path for this qpair is now unreliable — and the owning
 			 * req was leaked while the host hung on a CQE that will never arrive
-			 * (the old code only logged + broke). Disconnect the qpair, matching
+			 * unless the qpair is disconnected. Match
 			 * tcp.c's response to a CQ error: the core aborts in-flight requests
 			 * with transport errors so hosts complete instead of hanging.
-			 * A selectively suppressed operation may omit its ignored operation
-			 * context. Explicit-completion operations continue to report oreq. */
+			 * Provider errors are not guaranteed to carry an operation context. */
 			oreq = err.op_context;
 			if (oreq != NULL) {
 				error_qpair = oreq->oqpair;
@@ -2519,8 +2265,7 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 				spdk_trace_record(TRACE_OFI_CQ_ERROR, error_qpair->qpair.trace_id, 0, 0, 0);
 				spdk_nvmf_qpair_disconnect(&error_qpair->qpair);
 			} else {
-				/* No operation/endpoint context is guaranteed for errors from a
-				 * suppressed completion. The TX CQ is shared, so conservatively
+				/* The TX CQ is shared, so without an operation context conservatively
 				 * disconnect every qpair bound to it. */
 				TAILQ_FOREACH(iter, &opgroup->qpairs, link) {
 					spdk_nvmf_qpair_disconnect(&iter->qpair);
@@ -2532,16 +2277,13 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			SPDK_ERRLOG("ofi target: cq_tx fi_cq_read: %zd\n", rc);
 			break;
 		}
-		if (diagnostics_enabled) {
-			opgroup->stat.tx_cq_entries += rc;
-		}
 		for (k = 0; k < rc; k++) {
 			/* TX completion. Three kinds land on cq_tx, distinguished by the
 			 * op flags (the op_context is always the req):
 			 *  - FI_READ : a V2 fi_read finished — host WRITE data is now in
 			 *    data_buf; exec the command (was deferred at recv time).
 			 *  - FI_WRITE: a V2 fi_write finished — host READ data has landed in
-			 *    host memory (RC TRANSMIT_COMPLETE ⇒ delivered, p0b_findings);
+			 *    host memory (RC TRANSMIT_COMPLETE means delivered);
 			 *    now send the CQE.
 			 *  - else (FI_SEND): the response MSG was sent — recycle the req
 			 *    (this also re-posts the recv slot it was holding). */
@@ -2555,20 +2297,10 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			if (entries[k].flags & (FI_READ | FI_WRITE)) {
 				nvmf_ofi_rma_done(oreq);
 			} else {
-				assert(oreq->state == OFI_REQ_SEND_IN_FLIGHT ||
-				       oreq->state == OFI_REQ_ORDERED_CHAIN_IN_FLIGHT);
-				if (nvmf_ofi_req_diagnostics_enabled(oreq) && oreq->diag_send_tsc != 0) {
-					opgroup->stat.send_completion_ticks +=
-						spdk_get_ticks() - oreq->diag_send_tsc;
-					opgroup->stat.send_completion_count++;
-					oreq->diag_send_tsc = 0;
-				}
+				assert(oreq->state == OFI_REQ_SEND_IN_FLIGHT);
 				nvmf_ofi_req_release(oreq);
 			}
 		}
-	}
-	if (diagnostics_enabled && batch == opgroup->transport->cq_drain_batch) {
-		opgroup->stat.tx_cq_budget_hits++;
 	}
 
 	/* cq_tx drained ⇒ TX queue space freed; retry any RMA / CQE send deferred on
@@ -2584,13 +2316,7 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 					 opgroup->transport->cq_drain_batch - batch);
 
 		rc = fi_cq_read(opgroup->cq_rx, entries, want);
-		if (diagnostics_enabled) {
-			opgroup->stat.rx_cq_reads++;
-		}
 		if (rc == -FI_EAGAIN) {
-			if (diagnostics_enabled) {
-				opgroup->stat.rx_cq_empty++;
-			}
 			break;
 		}
 		if (rc == -FI_EAVAIL) {
@@ -2629,9 +2355,6 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			SPDK_ERRLOG("ofi target: cq_rx fi_cq_read: %zd\n", rc);
 			break;
 		}
-		if (diagnostics_enabled) {
-			opgroup->stat.rx_cq_entries += rc;
-		}
 		for (k = 0; k < rc; k++) {
 			struct spdk_nvmf_ofi_recv_slot *slot = entries[k].op_context;
 			struct spdk_nvmf_ofi_qpair *oqpair = slot->oqpair;
@@ -2647,9 +2370,6 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			batch++;
 			if (!use_multi_recv || multi_released) {
 				slot->posted = false;
-			}
-			if (multi_released) {
-				opgroup->stat.multi_recv_releases++;
 			}
 			if (oqpair->destroying) {
 				continue;
@@ -2678,12 +2398,6 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			req->req.xfer = spdk_nvmf_req_get_xfer(&req->req);
 			req->recv_slot = use_multi_recv ? NULL : slot;
 			req->use_rma = false;
-			if (diagnostics_enabled) {
-				req->diag_receive_tsc = spdk_get_ticks();
-			}
-			SPDK_DEBUGLOG(nvmf_ofi, "ofi target: recv cmd opc=0x%x cid=%u len=%zu xfer=%u\n",
-				       sqe->opc, sqe->cid, entries[k].len, req->req.xfer);
-			opgroup->stat.recv_cmds++;
 			spdk_trace_record(TRACE_OFI_RECV_CMD, oqpair->qpair.trace_id, 0,
 					  (uintptr_t)req, sqe->cid);
 
@@ -2699,7 +2413,7 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 				uint64_t rkey = sgl->keyed.key;
 
 				if (strcmp(oqpair->transport->provider, "cxi") == 0) {
-					const struct nvmf_ofi_rma_key_ext *ext;
+					const struct ofi_rma_key_ext *ext;
 
 					if (entries[k].len < sizeof(struct spdk_nvme_cmd) + sizeof(*ext)) {
 						SPDK_ERRLOG("ofi target: CXI keyed SGL missing 64-bit key extension (cid=%u)\n",
@@ -2710,9 +2424,9 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 						nvmf_ofi_req_release(req);
 						continue;
 					}
-					ext = (const struct nvmf_ofi_rma_key_ext *)
+					ext = (const struct ofi_rma_key_ext *)
 					      ((const uint8_t *)recv_buf + sizeof(struct spdk_nvme_cmd));
-					if (ofi_le32_to_cpu(ext->magic_le) != NVMF_OFI_RMA_KEY_EXT_MAGIC) {
+					if (ofi_le32_to_cpu(ext->magic_le) != OFI_RMA_KEY_EXT_MAGIC) {
 						SPDK_ERRLOG("ofi target: bad CXI RMA key extension magic (cid=%u)\n", sqe->cid);
 						if (multi_released) {
 							nvmf_ofi_repost_recv(oqpair, slot);
@@ -2723,7 +2437,7 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 					rkey |= (uint64_t)ofi_le32_to_cpu(ext->key_hi_le) << 32;
 				}
 
-				if (rlen > NVMF_OFI_RMA_DATA_SIZE) {
+				if (rlen > OFI_RMA_DATA_SIZE) {
 					/* Reject, never clamp: clamping moved only 128 KiB but still
 					 * completed the command as success — silent corruption for any
 					 * initiator that advertises a larger keyed SGL (our own host
@@ -2732,7 +2446,7 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 					 * appended; the error status skips the C2H-data branch). */
 					struct spdk_nvme_cpl *rsp = &req->rsp_storage.nvme_cpl;
 					SPDK_ERRLOG("ofi target: keyed SGL len %u > %d ceiling, rejecting (cid=%u)\n",
-						    rlen, NVMF_OFI_RMA_DATA_SIZE, sqe->cid);
+						    rlen, OFI_RMA_DATA_SIZE, sqe->cid);
 					memset(rsp, 0, sizeof(*rsp));
 					rsp->cid = sqe->cid;
 					rsp->status.sct = SPDK_NVME_SCT_GENERIC;
@@ -2777,11 +2491,6 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			if (entries[k].len > sizeof(struct spdk_nvme_cmd)) {
 				/* HOST_TO_CONTROLLER in-capsule data (e.g. CONNECT/WRITE). */
 				data_len = entries[k].len - sizeof(struct spdk_nvme_cmd);
-				if (sqe->opc == SPDK_NVME_OPC_FABRIC && data_len >= 1024) {
-					SPDK_DEBUGLOG(nvmf_ofi, "ofi target: connect data subnqn='%s' hostnqn='%s'\n",
-						       (char *)recv_buf + sizeof(struct spdk_nvme_cmd) + 256,
-						       (char *)recv_buf + sizeof(struct spdk_nvme_cmd) + 512);
-				}
 				if (use_multi_recv) {
 					memcpy(req->data_buf,
 					       (char *)recv_buf + sizeof(struct spdk_nvme_cmd), data_len);
@@ -2819,13 +2528,6 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			}
 			nvmf_ofi_request_exec(req);
 		}
-	}
-	if (diagnostics_enabled && batch == opgroup->transport->cq_drain_batch) {
-		opgroup->stat.rx_cq_budget_hits++;
-	}
-
-	if (reaped == 0) {
-		opgroup->stat.idle_polls++;
 	}
 	return reaped;
 }
@@ -2936,7 +2638,7 @@ nvmf_ofi_qpair_get_local_trid(struct spdk_nvmf_qpair *qpair,
 	struct spdk_nvmf_ofi_qpair *oqpair =
 		SPDK_CONTAINEROF(qpair, struct spdk_nvmf_ofi_qpair, qpair);
 
-	*trid = oqpair->local_trid;
+	*trid = oqpair->listen_trid;
 	return 0;
 }
 
@@ -2980,9 +2682,6 @@ nvmf_ofi_send_cqe(struct spdk_nvmf_ofi_req *oreq, uint32_t send_len)
 		return;
 	}
 	oreq->state = OFI_REQ_SEND_IN_FLIGHT;
-	if (nvmf_ofi_req_diagnostics_enabled(oreq)) {
-		oreq->diag_send_tsc = spdk_get_ticks();
-	}
 }
 
 /*
@@ -3001,22 +2700,9 @@ nvmf_ofi_req_complete(struct spdk_nvmf_request *req)
 	uint32_t send_len = sizeof(struct spdk_nvme_cpl);
 
 	assert(oreq->state == OFI_REQ_EXECUTING || oreq->state == OFI_REQ_RECEIVED);
-	if (nvmf_ofi_req_diagnostics_enabled(oreq) && oreq->diag_exec_tsc != 0) {
-		oreq->oqpair->group->stat.exec_ticks += spdk_get_ticks() - oreq->diag_exec_tsc;
-		oreq->oqpair->group->stat.exec_count++;
-		oreq->diag_exec_tsc = 0;
-	}
-
-	SPDK_DEBUGLOG(nvmf_ofi, "ofi target: req_complete cid=%u sct=%u sc=%u xfer=%u len=%u rma=%d\n",
-		       rsp->cid, rsp->status.sct, rsp->status.sc, req->xfer, req->length,
-		       oreq->use_rma);
-
 	/* Build the CQE into the send buffer. */
 	memcpy(oreq->send_buf, rsp, sizeof(*rsp));
 
-	/* Every completion path (in-capsule MSG, separate RMA CQE, or CQE fold)
-	 * produces exactly one CQE for this request. */
-	oreq->oqpair->group->stat.sent_cqes++;
 	spdk_trace_record(TRACE_OFI_SEND_CQE, oreq->oqpair->qpair.trace_id, 0,
 			  (uintptr_t)oreq, rsp->cid);
 
@@ -3026,19 +2712,13 @@ nvmf_ofi_req_complete(struct spdk_nvmf_request *req)
 		    req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST && req->length > 0 &&
 		    req->iovcnt > 0) {
 			if (oreq->oqpair->transport->use_cqe_fold) {
-				/* #46 fold: one fi_writemsg carries the read data AND the CQE
+				/* One fi_writemsg carries the read data and CQE
 				 * (CID as CQ immediate data). The host completes on the write;
 				 * no separate CQE MSG. */
 				if (nvmf_ofi_post_rma_cqe(oreq->oqpair, oreq) == 0) {
 					return;
 				}
 				/* fold failed hard (-FI_EAGAIN is queued inside) -> split path */
-			}
-			if (oreq->oqpair->transport->use_ordered_cqe) {
-				/* CXI: one unsignaled data WRITE followed by a delivery-fenced,
-				 * signaled SEND carrying the complete NVMe CQE. */
-				nvmf_ofi_post_ordered_cqe(oreq);
-				return;
 			}
 			/* Split path (CXI, or fold fallback): rma_done sends the CQE only
 			 * after the data write completion establishes remote visibility. */
@@ -3055,7 +2735,7 @@ nvmf_ofi_req_complete(struct spdk_nvmf_request *req)
 	if (spdk_nvme_cpl_is_success(rsp) &&
 	    req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST && req->length > 0 &&
 	    req->iovcnt > 0) {
-		uint32_t dlen = spdk_min(req->length, NVMF_OFI_IN_CAPSULE_DATA_SIZE);
+		uint32_t dlen = spdk_min(req->length, OFI_IN_CAPSULE_DATA_SIZE);
 		void *destination = (char *)oreq->send_buf + sizeof(*rsp);
 
 		if (req->iov[0].iov_base != destination) {
@@ -3076,8 +2756,6 @@ nvmf_ofi_req_free(struct spdk_nvmf_request *req)
 	case OFI_REQ_RMA_READ_IN_FLIGHT:
 	case OFI_REQ_RMA_WRITE_IN_FLIGHT:
 	case OFI_REQ_SEND_IN_FLIGHT:
-	case OFI_REQ_ORDERED_SEND_PENDING:
-	case OFI_REQ_ORDERED_CHAIN_IN_FLIGHT:
 		/* Provider-visible buffers remain owned until CQ progress or endpoint
 		 * teardown retires the operation. */
 		return;
@@ -3117,22 +2795,6 @@ nvmf_ofi_qpair_abort_request(struct spdk_nvmf_qpair *qpair,
 	spdk_nvmf_request_complete(req);
 }
 
-static int
-nvmf_ofi_subsystem_add_ns(struct spdk_nvmf_transport *transport,
-			  const struct spdk_nvmf_subsystem *subsystem,
-			  struct spdk_nvmf_ns *ns)
-{
-	return 0;
-}
-
-static int
-nvmf_ofi_listen_associate(struct spdk_nvmf_transport *transport,
-			  const struct spdk_nvmf_subsystem *subsystem,
-			  const struct spdk_nvme_transport_id *trid)
-{
-	return 0;
-}
-
 /* -------------------------------------------------------------------------- */
 /* Ops table + registration                                                   */
 /* -------------------------------------------------------------------------- */
@@ -3147,7 +2809,6 @@ nvmf_ofi_dump_opts(struct spdk_nvmf_transport *transport, struct spdk_json_write
 
 	assert(w != NULL);
 	spdk_json_write_named_string(w, "provider", otransport->provider);
-	spdk_json_write_named_bool(w, "diagnostics_enabled", otransport->diagnostics_enabled);
 	spdk_json_write_named_bool(w, "multi_recv", otransport->use_multi_recv);
 	spdk_json_write_named_bool(w, "local_rma_desc", otransport->use_local_rma_desc);
 	spdk_json_write_named_bool(w, "eager_direct_fill", otransport->use_eager_direct_fill);
@@ -3175,45 +2836,12 @@ nvmf_ofi_poll_group_dump_stat(struct spdk_nvmf_transport_poll_group *group,
 		SPDK_CONTAINEROF(group, struct spdk_nvmf_ofi_poll_group, group);
 
 	assert(w != NULL);
-	spdk_json_write_named_uint64(w, "polls", opgroup->stat.polls);
-	spdk_json_write_named_uint64(w, "idle_polls", opgroup->stat.idle_polls);
-	spdk_json_write_named_uint64(w, "tx_cq_reads", opgroup->stat.tx_cq_reads);
-	spdk_json_write_named_uint64(w, "tx_cq_empty", opgroup->stat.tx_cq_empty);
-	spdk_json_write_named_uint64(w, "tx_cq_entries", opgroup->stat.tx_cq_entries);
-	spdk_json_write_named_uint64(w, "tx_cq_budget_hits", opgroup->stat.tx_cq_budget_hits);
-	spdk_json_write_named_uint64(w, "rx_cq_reads", opgroup->stat.rx_cq_reads);
-	spdk_json_write_named_uint64(w, "rx_cq_empty", opgroup->stat.rx_cq_empty);
-	spdk_json_write_named_uint64(w, "rx_cq_entries", opgroup->stat.rx_cq_entries);
-	spdk_json_write_named_uint64(w, "rx_cq_budget_hits", opgroup->stat.rx_cq_budget_hits);
-	spdk_json_write_named_uint64(w, "recv_cmds", opgroup->stat.recv_cmds);
-	spdk_json_write_named_uint64(w, "sent_cqes", opgroup->stat.sent_cqes);
-	spdk_json_write_named_uint64(w, "rma_reads", opgroup->stat.rma_reads);
-	spdk_json_write_named_uint64(w, "rma_writes", opgroup->stat.rma_writes);
-	spdk_json_write_named_uint64(w, "ordered_cqes", opgroup->stat.ordered_cqes);
 	spdk_json_write_named_uint64(w, "rma_eagain", opgroup->stat.rma_eagain);
 	spdk_json_write_named_uint64(w, "send_eagain", opgroup->stat.send_eagain);
 	spdk_json_write_named_uint64(w, "recv_eagain", opgroup->stat.recv_eagain);
-	spdk_json_write_named_uint64(w, "recv_posts", opgroup->stat.recv_posts);
-	spdk_json_write_named_uint64(w, "multi_recv_releases", opgroup->stat.multi_recv_releases);
 	spdk_json_write_named_uint64(w, "no_free_reqs", opgroup->stat.no_free_reqs);
 	spdk_json_write_named_uint64(w, "cq_errors", opgroup->stat.cq_errors);
 	spdk_json_write_named_uint64(w, "recv_repost_defer", opgroup->stat.recv_repost_defer);
-	spdk_json_write_named_uint64(w, "rx_to_action_ticks", opgroup->stat.rx_to_action_ticks);
-	spdk_json_write_named_uint64(w, "rx_to_action_count", opgroup->stat.rx_to_action_count);
-	spdk_json_write_named_uint64(w, "exec_ticks", opgroup->stat.exec_ticks);
-	spdk_json_write_named_uint64(w, "exec_count", opgroup->stat.exec_count);
-	spdk_json_write_named_uint64(w, "h2c_rma_ticks", opgroup->stat.h2c_rma_ticks);
-	spdk_json_write_named_uint64(w, "h2c_rma_count", opgroup->stat.h2c_rma_count);
-	spdk_json_write_named_uint64(w, "c2h_rma_ticks", opgroup->stat.c2h_rma_ticks);
-	spdk_json_write_named_uint64(w, "c2h_rma_count", opgroup->stat.c2h_rma_count);
-	spdk_json_write_named_uint64(w, "send_completion_ticks",
-				     opgroup->stat.send_completion_ticks);
-	spdk_json_write_named_uint64(w, "send_completion_count",
-				     opgroup->stat.send_completion_count);
-	spdk_json_write_named_uint64(w, "request_residence_ticks",
-				     opgroup->stat.request_residence_ticks);
-	spdk_json_write_named_uint64(w, "request_residence_count",
-				     opgroup->stat.request_residence_count);
 }
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ofi = {
@@ -3226,13 +2854,9 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ofi = {
 
 	.listen = nvmf_ofi_listen,
 	.stop_listen = nvmf_ofi_stop_listen,
-	.listen_associate = nvmf_ofi_listen_associate,
 
-	.cdata_init = nvmf_ofi_cdata_init,
 	.listener_discover = nvmf_ofi_listener_discover,
 	.dump_opts = nvmf_ofi_dump_opts,
-
-	.subsystem_add_ns = nvmf_ofi_subsystem_add_ns,
 
 	.get_optimal_poll_group = nvmf_ofi_get_optimal_poll_group,
 	.poll_group_create = nvmf_ofi_poll_group_create,
