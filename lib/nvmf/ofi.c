@@ -279,6 +279,7 @@ struct spdk_nvmf_ofi_transport {
 	bool					diagnostics_enabled; /* opt-in hot-path CQ counters */
 	bool					use_multi_recv;
 	bool					use_local_rma_desc;
+	bool					use_eager_direct_fill;
 	uint32_t				cq_read_batch;
 	uint32_t				cq_drain_batch;
 
@@ -685,6 +686,9 @@ nvmf_ofi_create(struct spdk_nvmf_transport_opts *opts)
 	otransport->use_local_rma_desc = strcmp(prov, "cxi") == 0 &&
 					(getenv("OFI_CXI_LOCAL_RMA_DESC") == NULL ||
 					 strcmp(getenv("OFI_CXI_LOCAL_RMA_DESC"), "0") != 0);
+	otransport->use_eager_direct_fill = strcmp(prov, "cxi") == 0 &&
+					      (getenv("OFI_EAGER_DIRECT_FILL") == NULL ||
+					       strcmp(getenv("OFI_EAGER_DIRECT_FILL"), "0") != 0);
 	otransport->diagnostics_enabled = getenv("OFI_DIAGNOSTICS") != NULL &&
 					  strcmp(getenv("OFI_DIAGNOSTICS"), "0") != 0;
 	otransport->cq_read_batch = nvmf_ofi_env_u32("OFI_CQ_READ_BATCH",
@@ -735,12 +739,14 @@ nvmf_ofi_create(struct spdk_nvmf_transport_opts *opts)
 		goto err_poller;
 	}
 
-	SPDK_NOTICELOG("OFI transport initialized: provider=%s addr_format=%s cq_read=%u cq_drain=%u multi_recv=%d local_rma_desc=%d ordered_cqe=%d\n",
+	SPDK_NOTICELOG("OFI transport initialized: provider=%s addr_format=%s cq_read=%u cq_drain=%u "
+		       "multi_recv=%d local_rma_desc=%d eager_direct_fill=%d ordered_cqe=%d\n",
 		       otransport->provider,
 		       otransport->info->addr_format == FI_ADDR_CXI ? "CXI" : "SOCKADDR",
 		       otransport->cq_read_batch, otransport->cq_drain_batch,
 		       otransport->use_multi_recv,
 		       otransport->use_local_rma_desc,
+		       otransport->use_eager_direct_fill,
 		       otransport->use_ordered_cqe);
 	SPDK_INFOLOG(nvmf_ofi, "OFI transport: provider=%s caps=0x%lx mr_mode=0x%lx\n",
 		     otransport->provider,
@@ -2725,9 +2731,16 @@ nvmf_ofi_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 				req->req.iovcnt = 1;
 				req->req.data_from_pool = false;
 			} else if (req->req.xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
-				/* Response data: provide a buffer the core fills. */
+				/* Response data: provide a buffer the core fills. CXI advertises
+				 * iov_limit=1, so direct fill preserves one contiguous CQE+data SEND
+				 * while avoiding the completion-time payload copy. */
 				data_len = nvmf_ofi_cmd_data_len(req->req.cmd);
-				req->req.iov[0].iov_base = req->data_buf;
+				if (oqpair->transport->use_eager_direct_fill) {
+					req->req.iov[0].iov_base =
+						(char *)req->send_buf + sizeof(struct spdk_nvme_cpl);
+				} else {
+					req->req.iov[0].iov_base = req->data_buf;
+				}
 				req->req.iov[0].iov_len = data_len;
 				req->req.length = data_len;
 				req->req.iovcnt = 1;
@@ -2964,7 +2977,11 @@ nvmf_ofi_req_complete(struct spdk_nvmf_request *req)
 	    req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST && req->length > 0 &&
 	    req->iovcnt > 0) {
 		uint32_t dlen = spdk_min(req->length, NVMF_OFI_IN_CAPSULE_DATA_SIZE);
-		memcpy((char *)oreq->send_buf + sizeof(*rsp), req->iov[0].iov_base, dlen);
+		void *destination = (char *)oreq->send_buf + sizeof(*rsp);
+
+		if (req->iov[0].iov_base != destination) {
+			memcpy(destination, req->iov[0].iov_base, dlen);
+		}
 		send_len += dlen;
 	}
 	nvmf_ofi_send_cqe(oreq, send_len);
@@ -3031,6 +3048,7 @@ nvmf_ofi_dump_opts(struct spdk_nvmf_transport *transport, struct spdk_json_write
 	spdk_json_write_named_bool(w, "diagnostics_enabled", otransport->diagnostics_enabled);
 	spdk_json_write_named_bool(w, "multi_recv", otransport->use_multi_recv);
 	spdk_json_write_named_bool(w, "local_rma_desc", otransport->use_local_rma_desc);
+	spdk_json_write_named_bool(w, "eager_direct_fill", otransport->use_eager_direct_fill);
 	spdk_json_write_named_uint32(w, "cq_read_batch", otransport->cq_read_batch);
 	spdk_json_write_named_uint32(w, "cq_drain_batch", otransport->cq_drain_batch);
 	spdk_json_write_named_string(w, "addr_format",
