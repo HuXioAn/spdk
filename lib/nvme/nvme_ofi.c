@@ -1846,6 +1846,7 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	bool use_rma;
 	uint32_t io_qpair_count;
 	struct ofi_rma_key_ext rma_key_ext = {};
+	uint8_t inject_capsule[sizeof(req->cmd) + sizeof(rma_key_ext)];
 	struct iovec iov;
 	struct fi_msg msg = {0};
 	ssize_t rc;
@@ -2027,11 +2028,12 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 
 	tag = OFI_BUILD_TAG(cid, OFI_MSG_SQE);
 
-	/* Inject-direct: when the capsule is the bare SQE (no appended in-capsule data)
-	 * AND fits inject_size, send it straight from &req->cmd with fi_injectdata — NO
-	 * send slot and no memcpy into a slot buffer. The SQE is copied
-	 * inline by the provider and generates no TX completion. This is the V2 hot path
-	 * and every no-data command.
+	/* Inject-direct: when the capsule has no appended in-capsule payload and fits
+	 * inject_size, submit it with fi_injectdata — no send slot or TX completion.
+	 * A bare SQE is already contiguous in req->cmd. A CXI keyed command has an
+	 * additional private key extension, so assemble its 72-byte capsule on the stack;
+	 * fi_injectdata copies the buffer before returning. This covers the V2 RMA hot
+	 * path and every no-data command.
 	 *
 	 * Why inject (vs sendmsg) for the bare SQE matters under load: the core's resubmit
 	 * batch (nvme_qpair_resubmit_requests) submits many queued requests in a tight loop
@@ -2043,11 +2045,18 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 	 * tcp/sockets are lazy-connect: the first send returns -FI_EAGAIN while the
 	 * connection establishes; the provider progresses when its CQ is read, so spin a
 	 * bounded number while draining our own CQ between attempts. */
-	if (!has_incap_data && !has_rma_key_ext &&
-	    send_len <= tqpair->tctrlr->info->tx_attr->inject_size) {
+	if (!has_incap_data && send_len <= tqpair->tctrlr->info->tx_attr->inject_size) {
+		const void *inject_buf = &req->cmd;
 		int spins = 0;
+
+		if (has_rma_key_ext) {
+			memcpy(inject_capsule, &req->cmd, sizeof(req->cmd));
+			memcpy(inject_capsule + sizeof(req->cmd), &rma_key_ext,
+			       sizeof(rma_key_ext));
+			inject_buf = inject_capsule;
+		}
 		do {
-			rc = fi_injectdata(tqpair->ep, &req->cmd, send_len, tag,
+			rc = fi_injectdata(tqpair->ep, inject_buf, send_len, tag,
 					   tqpair->peer_fi_addr);
 			if (rc != -FI_EAGAIN) {
 				break;
