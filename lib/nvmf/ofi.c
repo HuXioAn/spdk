@@ -1108,9 +1108,21 @@ nvmf_ofi_ep_teardown(struct spdk_nvmf_ofi_qpair *oqpair)
 		oqpair->peer_fi_addr = FI_ADDR_NOTAVAIL;
 	}
 	if (oqpair->ep != NULL) {
-		rc = fi_close(&oqpair->ep->fid);
+		/* CXI may return -FI_EBUSY until cancelled receives and late TX
+		 * operations have made progress through the shared CQs. Keep the EP
+		 * pointer valid and retry while every operation context is still alive. */
+		for (polls = 0; polls < NVMF_OFI_TEARDOWN_DRAIN_POLLS; polls++) {
+			rc = fi_close(&oqpair->ep->fid);
+			if (rc != -FI_EBUSY || pg == NULL) {
+				break;
+			}
+			if (nvmf_ofi_poll_group_poll(&pg->group) == 0) {
+				spdk_delay_us(1);
+			}
+		}
 		if (rc != 0) {
 			SPDK_WARNLOG("ofi target: fi_close(endpoint): %s\n", fi_strerror(-rc));
+			return;
 		}
 		oqpair->ep = NULL;
 	}
@@ -1127,6 +1139,10 @@ nvmf_ofi_qpair_ep_destroy_msg(void *ctx)
 	struct spdk_nvmf_ofi_qpair *oqpair = ctx;
 
 	nvmf_ofi_ep_teardown(oqpair);
+	if (oqpair->ep != NULL) {
+		SPDK_ERRLOG("ofi target: retaining failed-setup qpair after endpoint close failure\n");
+		return;
+	}
 	free(oqpair);
 }
 
@@ -2827,6 +2843,18 @@ nvmf_ofi_qpair_fini(struct spdk_nvmf_qpair *qpair,
 	}
 	if (drain_polls == NVMF_OFI_TEARDOWN_DRAIN_POLLS) {
 		SPDK_WARNLOG("ofi target: shared CQ did not quiesce during qpair teardown\n");
+	}
+	if (oqpair->ep != NULL) {
+		nvmf_ofi_ep_teardown(oqpair);
+		if (oqpair->ep != NULL) {
+			/* Provider contexts still reference the request pools. Leak this rare
+			 * failed teardown rather than freeing live memory. */
+			SPDK_ERRLOG("ofi target: retaining qpair after endpoint close failure\n");
+			if (cb_fn != NULL) {
+				cb_fn(cb_arg);
+			}
+			return;
+		}
 	}
 	nvmf_ofi_qpair_free_pools(oqpair);
 
