@@ -15,12 +15,10 @@
  *   push READ data with RMA. The NVMe CID rides the CQ immediate-data field as a
  *   64-bit tag; FI_TAGGED is not used.
  *
- *   The sideband wire format is the frozen design §5.2 layout, duplicated here
- *   (lib/nvme and lib/nvmf are separate libraries; SPDK_STATIC_ASSERT guards
- *   against drift vs the target's copy in lib/nvmf/ofi_internal.h). The blocking
- *   framing helpers are NOT lifted — the host handshake is a non-blocking state
- *   machine driven from ctrlr_connect_qpair (called repeatedly by the core until
- *   it returns 0), mirroring the reactor-driven target.
+ *   The sideband wire format is the frozen design §5.2 layout shared with the
+ *   target through spdk_internal/ofi_wire.h. The host handshake remains a
+ *   non-blocking state machine driven from ctrlr_connect_qpair (called repeatedly
+ *   by the core until it returns 0), mirroring the reactor-driven target.
  *
  *   Design: docs/design/ofi_transport_design.md (host callbacks §4.3, lifecycle
  *   §3.4/§9, sideband §5.2/§5.3, data path §6). fi_getinfo hints are runtime-
@@ -34,6 +32,7 @@
 #include "spdk/log.h"
 #include "spdk/dma.h"
 #include "spdk/trace.h"
+#include "spdk_internal/ofi_wire.h"
 #include "spdk_internal/trace_defs.h"
 
 #include "nvme_internal.h"
@@ -109,75 +108,7 @@ SPDK_STATIC_ASSERT(sizeof(struct nvme_ofi_rma_key_ext) == 8, "RMA key extension 
 #define NVME_OFI_MULTI_RECV_BUF_SIZE	(64 * 1024)
 
 /* Sideband framing scratch: largest handshake frame is hdr + ADDR_EXCHANGE. */
-#define NVME_OFI_SB_BUF_SIZE		(sizeof(struct nvme_ofi_sb_hdr) + NVME_OFI_SB_MAX_ADDR_PAYLOAD)
-
-/* -------------------------------------------------------------------------- */
-/* Sideband wire format (frozen design §5.2 — MUST match lib/nvmf/ofi_internal.h) */
-/* -------------------------------------------------------------------------- */
-
-#define NVME_OFI_SB_MAGIC	{'O', 'F', 'I', 'S'}
-#define NVME_OFI_SB_MAGIC_LEN	4
-#define NVME_OFI_SB_VERSION	1
-
-enum nvme_ofi_sb_msg {
-	NVME_OFI_SB_HELLO	= 1,
-	NVME_OFI_SB_HELLO_ACK	= 2,
-	NVME_OFI_SB_ADDR_EXCH	= 3,
-	NVME_OFI_SB_ADDR_ACK	= 4,
-	NVME_OFI_SB_ERROR	= 6,
-};
-
-enum nvme_ofi_sb_status {
-	NVME_OFI_SB_STAT_OK	= 0,
-	NVME_OFI_SB_STAT_EINVAL	= 22,
-};
-
-struct nvme_ofi_sb_hdr {
-	uint8_t		magic[NVME_OFI_SB_MAGIC_LEN];
-	uint16_t	version_le;
-	uint16_t	msg_type_le;
-	uint32_t	payload_len_le;
-	uint32_t	status_le;
-	uint32_t	reserved_le;
-} __attribute__((packed));
-#define NVME_OFI_SB_HDR_SIZE	(sizeof(struct nvme_ofi_sb_hdr))
-
-#define NVME_OFI_SB_MAX_HELLO_PAYLOAD	496
-#define NVME_OFI_SB_MAX_ADDR_PAYLOAD	1100
-
-struct nvme_ofi_sb_hello {
-	char		hostnqn[224];
-	char		subnqn[224];
-	uint16_t	qid_le;
-	uint16_t	qdepth_le;
-	uint32_t	max_io_size_le;
-	uint32_t	io_unit_size_le;
-	uint32_t	in_capsule_data_size_le;
-	char		host_provider[32];
-} __attribute__((packed));
-
-#define NVME_OFI_SB_ADDR_FLAG_RMA	(1u << 0)
-struct nvme_ofi_sb_addr {
-	char		provider[32];
-	uint32_t	ep_addr_len_le;
-	uint32_t	mtu_le;
-	uint32_t	flags_le;
-	uint32_t	data_buf_count_le;
-	uint64_t	data_buf_addr_le;
-	uint64_t	data_buf_key_le;
-	/* followed by uint8_t ep_addr[ep_addr_len] */
-} __attribute__((packed));
-
-SPDK_STATIC_ASSERT(sizeof(struct nvme_ofi_sb_hdr) == 20, "sb hdr size");
-SPDK_STATIC_ASSERT(sizeof(struct nvme_ofi_sb_hello) == NVME_OFI_SB_MAX_HELLO_PAYLOAD, "sb hello size");
-SPDK_STATIC_ASSERT(sizeof(struct nvme_ofi_sb_addr) == 64, "sb addr size");
-
-/* The two deployment targets (x86_64, aarch64) are little-endian, so identity
- * LE helpers are correct (matches lib/nvmf/ofi_internal.h). */
-static inline uint16_t nvme_ofi_cpu_to_le16(uint16_t v) { return v; }
-static inline uint32_t nvme_ofi_cpu_to_le32(uint32_t v) { return v; }
-static inline uint16_t nvme_ofi_le16_to_cpu(uint16_t v) { return v; }
-static inline uint32_t nvme_ofi_le32_to_cpu(uint32_t v) { return v; }
+#define NVME_OFI_SB_BUF_SIZE		(sizeof(struct ofi_sb_hdr) + OFI_SB_MAX_ADDR_EXCHANGE_PAYLOAD)
 
 /* -------------------------------------------------------------------------- */
 /* V1 data-path framing (design §6.1)                                         */
@@ -458,48 +389,48 @@ nvme_ofi_getinfo(const char *prov, struct fi_info **out_info)
 /* -------------------------------------------------------------------------- */
 
 static void
-nvme_ofi_sb_hdr_init(struct nvme_ofi_sb_hdr *h, uint16_t msg_type,
+nvme_ofi_sb_hdr_init(struct ofi_sb_hdr *h, uint16_t msg_type,
 		     uint32_t payload_len, uint32_t status)
 {
-	static const char magic[NVME_OFI_SB_MAGIC_LEN] = NVME_OFI_SB_MAGIC;
+	static const char magic[OFI_SB_MAGIC_LEN] = OFI_SB_MAGIC_BYTES;
 	memset(h, 0, sizeof(*h));
-	memcpy(h->magic, magic, NVME_OFI_SB_MAGIC_LEN);
-	h->version_le = nvme_ofi_cpu_to_le16(NVME_OFI_SB_VERSION);
-	h->msg_type_le = nvme_ofi_cpu_to_le16(msg_type);
-	h->payload_len_le = nvme_ofi_cpu_to_le32(payload_len);
-	h->status_le = nvme_ofi_cpu_to_le32(status);
+	memcpy(h->magic, magic, OFI_SB_MAGIC_LEN);
+	h->version_le = ofi_cpu_to_le16(OFI_SB_VERSION);
+	h->msg_type_le = ofi_cpu_to_le16(msg_type);
+	h->payload_len_le = ofi_cpu_to_le32(payload_len);
+	h->status_le = ofi_cpu_to_le32(status);
 }
 
 /* Validate a fully-buffered header. Returns 0 ok, -1 reject. */
 static int
-nvme_ofi_sb_hdr_validate(const struct nvme_ofi_sb_hdr *h, uint16_t *msg_type,
+nvme_ofi_sb_hdr_validate(const struct ofi_sb_hdr *h, uint16_t *msg_type,
 			 uint32_t *payload_len, uint32_t *status)
 {
-	static const char magic[NVME_OFI_SB_MAGIC_LEN] = NVME_OFI_SB_MAGIC;
+	static const char magic[OFI_SB_MAGIC_LEN] = OFI_SB_MAGIC_BYTES;
 	uint32_t plen;
 	uint16_t mt;
 
-	if (memcmp(h->magic, magic, NVME_OFI_SB_MAGIC_LEN) != 0) {
+	if (memcmp(h->magic, magic, OFI_SB_MAGIC_LEN) != 0) {
 		return -1;
 	}
-	if (nvme_ofi_le16_to_cpu(h->version_le) != NVME_OFI_SB_VERSION) {
+	if (ofi_le16_to_cpu(h->version_le) != OFI_SB_VERSION) {
 		return -1;
 	}
 	if (h->reserved_le != 0) {
 		return -1;
 	}
-	plen = nvme_ofi_le32_to_cpu(h->payload_len_le);
-	mt = nvme_ofi_le16_to_cpu(h->msg_type_le);
+	plen = ofi_le32_to_cpu(h->payload_len_le);
+	mt = ofi_le16_to_cpu(h->msg_type_le);
 
 	switch (mt) {
-	case NVME_OFI_SB_HELLO:
-		if (plen > NVME_OFI_SB_MAX_HELLO_PAYLOAD) { return -1; }
+	case OFI_SB_HELLO:
+		if (plen > OFI_SB_MAX_HELLO_PAYLOAD) { return -1; }
 		break;
-	case NVME_OFI_SB_ADDR_EXCH:
-		if (plen > NVME_OFI_SB_MAX_ADDR_PAYLOAD) { return -1; }
+	case OFI_SB_ADDR_EXCHANGE:
+		if (plen > OFI_SB_MAX_ADDR_EXCHANGE_PAYLOAD) { return -1; }
 		break;
-	case NVME_OFI_SB_HELLO_ACK:
-	case NVME_OFI_SB_ADDR_ACK:
+	case OFI_SB_HELLO_ACK:
+	case OFI_SB_ADDR_ACK:
 		if (plen != 0) { return -1; }
 		break;
 	default:
@@ -507,7 +438,7 @@ nvme_ofi_sb_hdr_validate(const struct nvme_ofi_sb_hdr *h, uint16_t *msg_type,
 	}
 	if (msg_type) { *msg_type = mt; }
 	if (payload_len) { *payload_len = plen; }
-	if (status) { *status = nvme_ofi_le32_to_cpu(h->status_le); }
+	if (status) { *status = ofi_le32_to_cpu(h->status_le); }
 	return 0;
 }
 
@@ -516,7 +447,7 @@ static void
 nvme_ofi_sb_queue(struct nvme_ofi_qpair *tqpair, uint16_t msg_type,
 		  const void *payload, uint32_t payload_len, uint32_t status)
 {
-	struct nvme_ofi_sb_hdr *h = (struct nvme_ofi_sb_hdr *)tqpair->sb_tx;
+	struct ofi_sb_hdr *h = (struct ofi_sb_hdr *)tqpair->sb_tx;
 
 	assert(payload_len + sizeof(*h) <= sizeof(tqpair->sb_tx));
 	nvme_ofi_sb_hdr_init(h, msg_type, payload_len, status);
@@ -557,7 +488,7 @@ nvme_ofi_sb_flush(struct nvme_ofi_qpair *tqpair)
 static int
 nvme_ofi_sb_recv(struct nvme_ofi_qpair *tqpair, uint32_t want_payload)
 {
-	size_t want = NVME_OFI_SB_HDR_SIZE + want_payload;
+	size_t want = sizeof(struct ofi_sb_hdr) + want_payload;
 	ssize_t n;
 
 	while (tqpair->sb_rx_off < want) {
@@ -1569,68 +1500,68 @@ nvme_ofi_connect_poll(struct nvme_ofi_qpair *tqpair)
 			rc = nvme_ofi_sb_recv(tqpair, 0);
 			if (rc == -EAGAIN) { return 0; }
 			if (rc != 0) { goto fail; }
-			if (nvme_ofi_sb_hdr_validate((struct nvme_ofi_sb_hdr *)tqpair->sb_rx,
+			if (nvme_ofi_sb_hdr_validate((struct ofi_sb_hdr *)tqpair->sb_rx,
 						     &mt, &plen, &status) != 0 ||
-			    mt != NVME_OFI_SB_HELLO_ACK || status != NVME_OFI_SB_STAT_OK) {
+			    mt != OFI_SB_HELLO_ACK || status != OFI_SB_STAT_OK) {
 				SPDK_ERRLOG("ofi host: HELLO_ACK rejected\n");
 				goto fail;
 			}
-			nvme_ofi_sb_rx_consume(tqpair, NVME_OFI_SB_HDR_SIZE);
+			nvme_ofi_sb_rx_consume(tqpair, sizeof(struct ofi_sb_hdr));
 			tqpair->sb_state = NVME_OFI_SB_EP_CREATE;
 			continue;
 
 		case NVME_OFI_SB_EP_CREATE: {
-			uint8_t abuf[sizeof(struct nvme_ofi_sb_addr) + 256];
-			struct nvme_ofi_sb_addr *ah = (struct nvme_ofi_sb_addr *)abuf;
+			uint8_t abuf[sizeof(struct ofi_sb_addr) + 256];
+			struct ofi_sb_addr *ah = (struct ofi_sb_addr *)abuf;
 			uint32_t flags = 0;
 
 			rc = nvme_ofi_ep_create(tqpair);
 			if (rc != 0) { goto fail; }
 			memset(ah, 0, sizeof(*ah));
 			snprintf(ah->provider, sizeof(ah->provider), "%s", tqpair->tctrlr->provider);
-			ah->ep_addr_len_le = nvme_ofi_cpu_to_le32((uint32_t)tqpair->local_ep_addr_len);
+			ah->ep_addr_len_le = ofi_cpu_to_le32((uint32_t)tqpair->local_ep_addr_len);
 			if (tqpair->tctrlr->use_rma) {
-				flags |= NVME_OFI_SB_ADDR_FLAG_RMA;
+				flags |= OFI_SB_ADDR_FLAG_RMA_CAPABLE;
 			}
-			ah->flags_le = nvme_ofi_cpu_to_le32(flags);
+			ah->flags_le = ofi_cpu_to_le32(flags);
 			memcpy(abuf + sizeof(*ah), tqpair->local_ep_addr, tqpair->local_ep_addr_len);
-			nvme_ofi_sb_queue(tqpair, NVME_OFI_SB_ADDR_EXCH, abuf,
+			nvme_ofi_sb_queue(tqpair, OFI_SB_ADDR_EXCHANGE, abuf,
 					  sizeof(*ah) + (uint32_t)tqpair->local_ep_addr_len,
-					  NVME_OFI_SB_STAT_OK);
+					  OFI_SB_STAT_OK);
 			tqpair->sb_state = NVME_OFI_SB_ADDR_RECV;
 			continue;
 		}
 
 		case NVME_OFI_SB_ADDR_RECV: {
-			struct nvme_ofi_sb_addr *pa;
+			struct ofi_sb_addr *pa;
 
 			rc = nvme_ofi_sb_flush(tqpair);	/* send our ADDR_EXCHANGE */
 			if (rc == -EAGAIN) { return 0; }
 			if (rc != 0) { goto fail; }
 
-			if (tqpair->sb_rx_off < NVME_OFI_SB_HDR_SIZE) {
+			if (tqpair->sb_rx_off < sizeof(struct ofi_sb_hdr)) {
 				rc = nvme_ofi_sb_recv(tqpair, 0);
 				if (rc == -EAGAIN) { return 0; }
 				if (rc != 0) { goto fail; }
 			}
-			if (nvme_ofi_sb_hdr_validate((struct nvme_ofi_sb_hdr *)tqpair->sb_rx,
+			if (nvme_ofi_sb_hdr_validate((struct ofi_sb_hdr *)tqpair->sb_rx,
 						     &mt, &plen, &status) != 0 ||
-			    mt != NVME_OFI_SB_ADDR_EXCH) {
+			    mt != OFI_SB_ADDR_EXCHANGE) {
 				SPDK_ERRLOG("ofi host: ADDR_EXCHANGE malformed\n");
 				goto fail;
 			}
 			rc = nvme_ofi_sb_recv(tqpair, plen);
 			if (rc == -EAGAIN) { return 0; }
 			if (rc != 0) { goto fail; }
-			pa = (struct nvme_ofi_sb_addr *)(tqpair->sb_rx + NVME_OFI_SB_HDR_SIZE);
-			tqpair->peer_ep_addr_len = nvme_ofi_le32_to_cpu(pa->ep_addr_len_le);
+			pa = (struct ofi_sb_addr *)(tqpair->sb_rx + sizeof(struct ofi_sb_hdr));
+			tqpair->peer_ep_addr_len = ofi_le32_to_cpu(pa->ep_addr_len_le);
 			if (tqpair->peer_ep_addr_len > sizeof(tqpair->peer_ep_addr) ||
 			    plen < sizeof(*pa) + tqpair->peer_ep_addr_len) {
 				SPDK_ERRLOG("ofi host: bad peer ep_addr_len\n");
 				goto fail;
 			}
 			memcpy(tqpair->peer_ep_addr,
-			       tqpair->sb_rx + NVME_OFI_SB_HDR_SIZE + sizeof(*pa),
+			       tqpair->sb_rx + sizeof(struct ofi_sb_hdr) + sizeof(*pa),
 			       tqpair->peer_ep_addr_len);
 			{
 				fi_addr_t peer = FI_ADDR_NOTAVAIL;
@@ -1642,8 +1573,8 @@ nvme_ofi_connect_poll(struct nvme_ofi_qpair *tqpair)
 				}
 				tqpair->peer_fi_addr = peer;
 			}
-			nvme_ofi_sb_rx_consume(tqpair, NVME_OFI_SB_HDR_SIZE + plen);
-			nvme_ofi_sb_queue(tqpair, NVME_OFI_SB_ADDR_ACK, NULL, 0, NVME_OFI_SB_STAT_OK);
+			nvme_ofi_sb_rx_consume(tqpair, sizeof(struct ofi_sb_hdr) + plen);
+			nvme_ofi_sb_queue(tqpair, OFI_SB_ADDR_ACK, NULL, 0, OFI_SB_STAT_OK);
 			tqpair->sb_state = NVME_OFI_SB_ADDR_ACK_XCHG;
 			continue;
 		}
@@ -1657,13 +1588,13 @@ nvme_ofi_connect_poll(struct nvme_ofi_qpair *tqpair)
 			rc = nvme_ofi_sb_recv(tqpair, 0);	/* recv peer's ADDR_ACK */
 			if (rc == -EAGAIN) { return 0; }
 			if (rc != 0) { goto fail; }
-			if (nvme_ofi_sb_hdr_validate((struct nvme_ofi_sb_hdr *)tqpair->sb_rx,
+			if (nvme_ofi_sb_hdr_validate((struct ofi_sb_hdr *)tqpair->sb_rx,
 						     &mt, &plen, &status) != 0 ||
-			    mt != NVME_OFI_SB_ADDR_ACK) {
+			    mt != OFI_SB_ADDR_ACK) {
 				SPDK_ERRLOG("ofi host: ADDR_ACK malformed\n");
 				goto fail;
 			}
-			nvme_ofi_sb_rx_consume(tqpair, NVME_OFI_SB_HDR_SIZE);
+			nvme_ofi_sb_rx_consume(tqpair, sizeof(struct ofi_sb_hdr));
 
 			/* Transport connected: pre-post recv buffers, then send the Fabrics
 			 * CONNECT (the core built it via nvme_fabric_qpair_connect_async). */
@@ -1730,7 +1661,7 @@ nvme_ofi_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpa
 {
 	struct nvme_ofi_qpair *tqpair = nvme_ofi_qpair(qpair);
 	const struct spdk_nvme_transport_id *trid = &ctrlr->trid;
-	struct nvme_ofi_sb_hello hello;
+	struct ofi_sb_hello hello;
 	long port;
 
 	if (tqpair->sb_state == NVME_OFI_SB_FAILED) {
@@ -1754,13 +1685,13 @@ nvme_ofi_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpa
 	memset(&hello, 0, sizeof(hello));
 	snprintf(hello.hostnqn, sizeof(hello.hostnqn), "%s", ctrlr->opts.hostnqn);
 	snprintf(hello.subnqn, sizeof(hello.subnqn), "%s", trid->subnqn);
-	hello.qid_le = nvme_ofi_cpu_to_le16(qpair->id);
-	hello.qdepth_le = nvme_ofi_cpu_to_le16((uint16_t)tqpair->num_slots);
-	hello.max_io_size_le = nvme_ofi_cpu_to_le32(NVME_OFI_IN_CAPSULE_DATA_SIZE);
-	hello.io_unit_size_le = nvme_ofi_cpu_to_le32(NVME_OFI_IN_CAPSULE_DATA_SIZE);
-	hello.in_capsule_data_size_le = nvme_ofi_cpu_to_le32(NVME_OFI_IN_CAPSULE_DATA_SIZE);
+	hello.qid_le = ofi_cpu_to_le16(qpair->id);
+	hello.qdepth_le = ofi_cpu_to_le16((uint16_t)tqpair->num_slots);
+	hello.max_io_size_le = ofi_cpu_to_le32(NVME_OFI_IN_CAPSULE_DATA_SIZE);
+	hello.io_unit_size_le = ofi_cpu_to_le32(NVME_OFI_IN_CAPSULE_DATA_SIZE);
+	hello.in_capsule_data_size_le = ofi_cpu_to_le32(NVME_OFI_IN_CAPSULE_DATA_SIZE);
 	snprintf(hello.host_provider, sizeof(hello.host_provider), "%s", tqpair->tctrlr->provider);
-	nvme_ofi_sb_queue(tqpair, NVME_OFI_SB_HELLO, &hello, sizeof(hello), NVME_OFI_SB_STAT_OK);
+	nvme_ofi_sb_queue(tqpair, OFI_SB_HELLO, &hello, sizeof(hello), OFI_SB_STAT_OK);
 	tqpair->sb_state = NVME_OFI_SB_HELLO_SEND;
 	return 0;
 }
@@ -2104,8 +2035,8 @@ nvme_ofi_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request
 			/* CXI keys observed on LUMI use all 64 bits.  Silently assigning
 			 * one to keyed.key truncates the high half and the peer reports a
 			 * protection error (prov_errno=18) on its first fi_write. */
-			rma_key_ext.magic_le = nvme_ofi_cpu_to_le32(NVME_OFI_RMA_KEY_EXT_MAGIC);
-			rma_key_ext.key_hi_le = nvme_ofi_cpu_to_le32((uint32_t)(rma_key >> 32));
+			rma_key_ext.magic_le = ofi_cpu_to_le32(NVME_OFI_RMA_KEY_EXT_MAGIC);
+			rma_key_ext.key_hi_le = ofi_cpu_to_le32((uint32_t)(rma_key >> 32));
 			has_rma_key_ext = true;
 		}
 

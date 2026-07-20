@@ -3,10 +3,8 @@
  *
  *   NVMe-oF OFI transport — internal header.
  *
- *   Sideband control-channel wire format (design §5.2), lifted verbatim from
- *   the prototype (prototype/lib/ofi_sb.h). The wire structs and validators are
- *   carrier-agnostic and shared between the target (lib/nvmf/ofi.c) and the
- *   future host (lib/nvme/nvme_ofi.c) sides — design §3.1.
+ *   The carrier-agnostic sideband wire format is shared with the host through
+ *   spdk_internal/ofi_wire.h. This header adds the target-side validation API.
  *
  *   Wire-format invariants (design §5.2.1):
  *     - all multi-byte integers are explicitly little-endian
@@ -20,6 +18,7 @@
 #define SPDK_NVMF_OFI_INTERNAL_H
 
 #include "spdk/stdinc.h"
+#include "spdk_internal/ofi_wire.h"
 
 /* ------------------------------------------------------------- wire magic */
 
@@ -29,111 +28,7 @@
  * on big-endian, so a memcmp against 4 fixed bytes is the only portable form
  * (design v1.1 note).
  */
-#define OFI_SB_MAGIC_BYTES	{'O', 'F', 'I', 'S'}
-#define OFI_SB_MAGIC_LEN	4
 extern const char ofi_sb_magic[OFI_SB_MAGIC_LEN];
-
-#define OFI_SB_VERSION		1
-
-/* ------------------------------------------------------------- msg types */
-
-enum ofi_sb_msg_type {
-	OFI_SB_HELLO		= 1,
-	OFI_SB_HELLO_ACK	= 2,
-	OFI_SB_ADDR_EXCHANGE	= 3,
-	OFI_SB_ADDR_ACK		= 4,
-	OFI_SB_TEARDOWN		= 5,
-	OFI_SB_ERROR		= 6,
-	OFI_SB_HEARTBEAT	= 7,
-};
-
-/* status codes that may appear in hdr.status (design §5.2.1 + §9). */
-enum ofi_sb_status {
-	OFI_SB_STAT_OK		= 0,
-	OFI_SB_STAT_ENOENT	= 2,	/* subnqn / hostnqn not found */
-	OFI_SB_STAT_EINVAL	= 22,	/* validation failure */
-	OFI_SB_STAT_E2BIG	= 7,	/* payload too large */
-	OFI_SB_STAT_ENOMEM	= 12,	/* out of resources */
-	OFI_SB_STAT_EACCES	= 13,	/* hostnqn not allowed */
-	OFI_SB_STAT_ETRANSIENT	= 200,	/* transient; retry */
-};
-
-/* per-msg_type payload caps. Receiver rejects anything bigger (design §5.2.1). */
-#define OFI_SB_MAX_HELLO_PAYLOAD		496
-#define OFI_SB_MAX_ADDR_EXCHANGE_PAYLOAD	1100
-#define OFI_SB_MAX_TEARDOWN_PAYLOAD		4
-#define OFI_SB_MAX_ERROR_PAYLOAD		256
-#define OFI_SB_MAX_HEARTBEAT_PAYLOAD		0
-#define OFI_SB_MAX_TOTAL_PAYLOAD		(16384 - 20)
-
-/* ----------------------------------------------------------- wire structs */
-
-/* Common header — exactly 20 bytes on the wire. Layout MUST stay packed and
- * field order MUST NOT change after the first deployment. */
-struct ofi_sb_hdr {
-	uint8_t		magic[OFI_SB_MAGIC_LEN];	/* 'O','F','I','S' */
-	uint16_t	version_le;			/* == OFI_SB_VERSION */
-	uint16_t	msg_type_le;			/* enum ofi_sb_msg_type */
-	uint32_t	payload_len_le;			/* byte count of payload that follows */
-	uint32_t	status_le;			/* enum ofi_sb_status (0 = OK) */
-	uint32_t	reserved_le;			/* must be 0; receiver rejects non-0 */
-} __attribute__((packed));
-
-/* HELLO payload — exactly 496 bytes (design §5.2.2). */
-struct ofi_sb_hello {
-	char		hostnqn[224];			/* NUL-terminated; receiver forces [223]=0 */
-	char		subnqn[224];			/* same */
-	uint16_t	qid_le;				/* 0 = admin */
-	uint16_t	qdepth_le;
-	uint32_t	max_io_size_le;
-	uint32_t	io_unit_size_le;
-	uint32_t	in_capsule_data_size_le;
-	char		host_provider[32];		/* NUL-terminated; receiver forces [31]=0 */
-} __attribute__((packed));
-
-/* ADDR_EXCHANGE payload — fixed part is 64 bytes, then ep_addr[] (design §5.2.3). */
-#define OFI_SB_ADDR_FLAG_RMA_CAPABLE	(1u << 0)
-struct ofi_sb_addr {
-	char		provider[32];			/* NUL-terminated */
-	uint32_t	ep_addr_len_le;
-	uint32_t	mtu_le;
-	uint32_t	flags_le;			/* bit0 = RMA-capable (V2) */
-	uint32_t	data_buf_count_le;		/* RESERVED (kept for wire-layout stability) */
-	uint64_t	data_buf_addr_le;		/* RESERVED (kept for wire-layout stability) */
-	uint64_t	data_buf_key_le;		/* RESERVED (kept for wire-layout stability) */
-	/* followed by uint8_t ep_addr[ep_addr_len].
-	 * NOTE: data_buf_{count,addr,key} are vestigial from an early V2 design and
-	 * are never set or read today — V2 carries the host's RMA {addr,key} in the
-	 * NVMe command's keyed SGL (dptr), not in ADDR_EXCHANGE. They remain in the
-	 * struct only to keep the 64-byte fixed header / wire format stable. */
-} __attribute__((packed));
-
-struct ofi_sb_teardown {
-	uint32_t	reason_le;			/* 1=normal, 2=qpair_fini, 3=oom */
-} __attribute__((packed));
-
-struct ofi_sb_error {
-	uint32_t	err_code_le;
-	char		err_msg[252];			/* NUL-terminated */
-} __attribute__((packed));				/* 256 bytes */
-
-/* --------------------------------------------------------- little-endian
- *
- * The prototype shipped value-style identity helpers (x86/ARM are LE). SPDK's
- * spdk/endian.h provides pointer-style accessors (to_le16(out,in)/from_le16(ptr))
- * with a different calling convention. To keep the lifted validators/inits
- * byte-for-byte identical to the proven prototype code, we keep the value-style
- * identity helpers here. On a hypothetical big-endian build these would need to
- * byte-swap; the wire is LE by spec and the only deployment targets (x86_64,
- * aarch64) are little-endian, so identity is correct in practice. A big-endian
- * port replaces just these six inlines.
- */
-static inline uint16_t ofi_cpu_to_le16(uint16_t v) { return v; }
-static inline uint32_t ofi_cpu_to_le32(uint32_t v) { return v; }
-static inline uint64_t ofi_cpu_to_le64(uint64_t v) { return v; }
-static inline uint16_t ofi_le16_to_cpu(uint16_t v) { return v; }
-static inline uint32_t ofi_le32_to_cpu(uint32_t v) { return v; }
-static inline uint64_t ofi_le64_to_cpu(uint64_t v) { return v; }
 
 /* --------------------------------------------------------------- API */
 

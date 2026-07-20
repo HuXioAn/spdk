@@ -3,9 +3,9 @@
  *
  *   NVMe-oF OFI transport — sideband control protocol (design §5.2).
  *
- *   The wire structs and validators are lifted verbatim from the prototype
- *   (prototype/lib/ofi_sb.c) — they are pure and carrier-agnostic. Only the
- *   logging macros change (OFI_*LOG -> SPDK_*LOG). The prototype's blocking
+ *   The target-side validators originated in prototype/lib/ofi_sb.c. The wire
+ *   structures and compile-time layout checks are shared with the host through
+ *   spdk_internal/ofi_wire.h. The prototype's blocking
  *   POSIX framing I/O is NOT lifted: in SPDK the framing is driven from a
  *   reactor sock callback (non-blocking, buffer-and-advance) in ofi.c. A
  *   blocking-style framed writer is provided here for the small, bounded
@@ -20,20 +20,6 @@
 /* The 4 wire magic bytes. Compared byte-wise (memcmp), never as a uint32, so
  * the value is identical on big- and little-endian peers (design v1.1 note). */
 const char ofi_sb_magic[OFI_SB_MAGIC_LEN] = OFI_SB_MAGIC_BYTES;
-
-/* Compile-time wire-layout guarantees. If any of these ever fire, the on-wire
- * format has drifted from the design and every existing peer is now
- * incompatible — fail the build rather than ship a silent mismatch. */
-SPDK_STATIC_ASSERT(sizeof(struct ofi_sb_hdr) == 20,
-		   "ofi_sb_hdr must be exactly 20 bytes on the wire");
-SPDK_STATIC_ASSERT(sizeof(struct ofi_sb_hello) == OFI_SB_MAX_HELLO_PAYLOAD,
-		   "ofi_sb_hello must be exactly 496 bytes on the wire");
-SPDK_STATIC_ASSERT(sizeof(struct ofi_sb_addr) == 64,
-		   "ofi_sb_addr fixed part must be 64 bytes on the wire");
-SPDK_STATIC_ASSERT(sizeof(struct ofi_sb_teardown) == OFI_SB_MAX_TEARDOWN_PAYLOAD,
-		   "ofi_sb_teardown must be 4 bytes");
-SPDK_STATIC_ASSERT(sizeof(struct ofi_sb_error) == OFI_SB_MAX_ERROR_PAYLOAD,
-		   "ofi_sb_error must be 256 bytes");
 
 /* --------------------------------------------------------------- validator */
 
